@@ -1,30 +1,3 @@
-// ═════════════════════════════════════════════════════════════
-//  BOARD: ESP-01S (1MB flash) — CRITICAL SETUP STEP
-// ═════════════════════════════════════════════════════════════
-//  OTA on a 1MB ESP-01S REQUIRES the correct flash size/partition
-//  scheme selected in Arduino IDE BEFORE compiling, or OTA will
-//  ALWAYS fail with "not enough space" no matter how clean the
-//  code is. This is a board-manager setting, not code:
-//
-//    Tools > Board            : Generic ESP8266 Module
-//    Tools > Flash Size       : 1M (FS:64KB, OTA:~470KB)
-//                               (name varies slightly by core version —
-//                                pick any "1M" option that reserves
-//                                two OTA app slots, NOT "1M (no OTA)")
-//    Tools > Reset Method     : ck / nodemcu (whichever your board needs)
-//
-//  If "1M (no OTA)" or "1M (FS:none OTA:~502KB)" without two OTA
-//  slots is selected, ESPhttpUpdate will fail immediately regardless
-//  of RAM or network — always double check this first.
-//
-//  Because flash is this tight, LittleFS is also small — this is
-//  why the code below is careful to NEVER write to flash during
-//  the OTA attempt itself (only RAM/state changes), and only
-//  writes flash for config changes that already existed in your
-//  original design (token, credentials, state file). No new flash
-//  writes were added by this fix.
-// ═════════════════════════════════════════════════════════════
-
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESPAsyncTCP.h>
@@ -61,8 +34,8 @@ struct DailySchedule;
 //  TCP CLIENT
 // ─────────────────────────────────────────────────────────────
 WiFiClient        tcpClient;
-const char*       serverIP   = "192.168.10.200"; // <--- CHANGE THIS
-const uint16_t    serverPort = 4455;              // <--- CHANGE THIS
+const char* serverIP   = "192.168.10.200"; // <--- CHANGE THIS
+const uint16_t    serverPort = 4455;             // <--- CHANGE THIS
 
 // ─────────────────────────────────────────────────────────────
 //  TOKEN / REGISTRATION
@@ -135,11 +108,6 @@ bool          manualOverrideON  = false;
 //  OTA STATE (RAM only)
 // ─────────────────────────────────────────────────────────────
 bool          pendingOtaUpdate  = false;
-
-// Pre-computed once at boot (MAC never changes at runtime) instead of being
-// rebuilt with String allocations on EVERY line received over TCP. Rebuilding
-// these on every command fragmented the heap over time, which is the likely
-// cause of BearSSL's TLS handshake to GitHub dying mid-connection (-5).
 char myMacStr[16]           = "";  // e.g. "483FDA5CCA34"
 char targetUpdateCmdStr[32] = "";  // e.g. "483FDA5CCA34:UPDATE"
 
@@ -199,7 +167,7 @@ const byte  DNS_PORT = 53;
 const char* AP_PASS  = "12345678";
 char global_AP_Name[32] = "";
 
-DNSServer       dnsServer;
+DNSServer        dnsServer;
 AsyncWebServer server(80);
 
 bool          inSetupMode        = false;
@@ -762,8 +730,8 @@ void startSetupPortal() {
     }
     tempSSID = r->getParam("ssid")->value(); tempSSID.trim();
     tempPASS = r->getParam("pass")->value();
-    if (tempSSID.length() == 0) { r->send(400, "text/plain", F("SSID is empty"));             return; }
-    if (tempPASS.length() == 0) { r->send(400, "text/plain", F("Password is empty"));         return; }
+    if (tempSSID.length() == 0) { r->send(400, "text/plain", F("SSID is empty"));              return; }
+    if (tempPASS.length() == 0) { r->send(400, "text/plain", F("Password is empty"));          return; }
     if (tempPASS.length() < 8)  { r->send(400, "text/plain", F("Password must be 8+ chars")); return; }
     triggerConnection = true;
     r->send(200, "text/plain", F("OK"));
@@ -787,7 +755,7 @@ void startSetupPortal() {
 //  SETUP
 // ─────────────────────────────────────────────────────────────
 void setup() {
-  ESP.wdtEnable(8000);
+  ESP.wdtEnable(50000);
 
   pinMode(LED_PIN,   OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);
@@ -1043,29 +1011,28 @@ void loop() {
       for (char* p = upperBuf; *p; ++p) *p = toupper(*p);
 
       // ────────────────────────────────────────────────────────
-      //  SMART OTA UPDATE LOGIC (MAC Specific + Version Check)
-      //  myMacStr / targetUpdateCmdStr are computed ONCE at boot
-      //  (see setup()) instead of being rebuilt with String
-      //  allocations on every single line received — repeated
-      //  alloc/free here was fragmenting the heap over time, which
-      //  is the likely cause of the BearSSL handshake to GitHub
-      //  dying mid-connection (HTTP code -5) even when total free
-      //  heap looked fine in STATUS.
+      //  SMART OTA UPDATE LOGIC (RAM-Optimized for ESP-01S)
+      // ────────────────────────────────────────────────────────
+    // ────────────────────────────────────────────────────────
+      //  SMART OTA UPDATE LOGIC (Fixed for GitHub TLS)
       // ────────────────────────────────────────────────────────
       if (strcmp(upperBuf, targetUpdateCmdStr) == 0) {
-        char msgBuf[128];
-        snprintf(msgBuf, sizeof(msgBuf), "ACK: Target match (%s). Checking GitHub for firmware...", myMacStr);
-        tcpSend(msgBuf);
-
-        Serial.printf("Free heap before version check: %u bytes | Fragmentation: %u%% | RSSI: %d dBm\n",
-                       ESP.getFreeHeap(), ESP.getHeapFragmentation(), WiFi.RSSI());
+        
+        // 1. EXECUTE YOUR IDEA: Pause background timers/relays BEFORE the heavy version check
+        changeMode(0);
+        autoTimerRunning = false;
+        dailySched.active = false;
+        setRelay(false);
+        tcpSend("ACK: Background tasks paused. Checking GitHub for firmware update...");
+        
+        Serial.printf("Heap before version check: %u bytes\n", ESP.getFreeHeap());
 
         WiFiClientSecure secureClient;
-        secureClient.setBufferSizes(4096, 512); // shrink TLS buffers — ESP-01S is very tight on RAM
-        secureClient.setInsecure();
-        HTTPClient http;
+        secureClient.setInsecure();            
+        // CRITICAL FIX: DO NOT use setBufferSizes() here. 
+        // GitHub does not support small fragments. We must let it use the default 16KB buffer.
 
-        // --- EDIT THIS LINE: CHANGE 'YourUsername/techorc-iot-updates' TO YOUR DETAILS ---
+        HTTPClient http;
         http.begin(secureClient, "https://raw.githubusercontent.com/karthii12345/tech_ota/refs/heads/main/version.txt");
         int httpCode = http.GET();
 
@@ -1075,17 +1042,17 @@ void loop() {
 
           char buf[128];
           if (latestVersion == String(CURRENT_VERSION)) {
-            snprintf(buf, sizeof(buf), "UPDATE_READY: Device is already up to date (v%s). No update needed.", CURRENT_VERSION);
+            snprintf(buf, sizeof(buf), "UPDATE_READY: Device is already up to date (v%s).", CURRENT_VERSION);
             tcpSend(buf);
             pendingOtaUpdate = false;
           } else {
             snprintf(buf, sizeof(buf), "UPDATE_READY: Current v%s -> New v%s. Send YES to install.", CURRENT_VERSION, latestVersion.c_str());
             tcpSend(buf);
-            pendingOtaUpdate = true;
+            pendingOtaUpdate = true; // Wait for "YES" command
           }
         } else {
           char ebuf[96];
-          snprintf(ebuf, sizeof(ebuf), "ERR: Failed to reach GitHub (HTTP code %d) or version file not found.", httpCode);
+          snprintf(ebuf, sizeof(ebuf), "ERR: Failed to reach GitHub (HTTP %d).", httpCode);
           tcpSend(ebuf);
           Serial.println(ebuf);
         }
@@ -1095,73 +1062,31 @@ void loop() {
 
       // ────────────────────────────────────────────────────────
       //  EXECUTE OTA UPDATE ON "YES"
-      //  Fixes applied vs original:
-      //   1. tcpClient.stop() BEFORE the HTTPS call — frees the
-      //      control-server socket's RAM so BearSSL has room.
-      //   2. setBufferSizes(512,512) — shrinks BearSSL's default
-      //      ~10KB TLS buffer footprint to ~1KB, critical on
-      //      ESP-01S / low-heap situations.
-      //   3. Free-heap logged to Serial before the attempt, so you
-      //      can see directly whether RAM was the limiting factor.
-      //   4. Failure reason logged to Serial (not tcpSend), since
-      //      tcpClient is already stopped by this point and any
-      //      tcpSend() call here would silently do nothing.
-      //   5. No flash writes occur anywhere in this block — matches
-      //      your requirement of not wearing flash during OTA.
       // ────────────────────────────────────────────────────────
       if (pendingOtaUpdate && strcmp(upperBuf, "YES") == 0) {
         pendingOtaUpdate = false;
 
-        // Safety first: pause all timers, relay OFF (RAM only, no flash write)
-        changeMode(0);
-        schedule.active   = false;
-        dailySched.active = false;
-        autoTimerRunning  = false;
-        manualOverrideON  = false;
-        setRelay(false);
-
-        tcpSend("ACK: Starting firmware download... Device will be unresponsive for 30 seconds.");
-        tcpSend("STATUS: If successful, connection will drop and device will reboot.");
+        tcpSend("ACK: Starting firmware download... Device will reboot on success.");
         delay(500);
 
-        // ── Free RAM before attempting HTTPS OTA ──
-        tcpClient.stop();
+        // 2. Free maximum RAM for the actual binary download
+        tcpClient.stop(); 
         isAuthenticated = false;
-        Serial.printf("Free heap before OTA attempt: %u bytes | Fragmentation: %u%% | RSSI: %d dBm\n",
-                       ESP.getFreeHeap(), ESP.getHeapFragmentation(), WiFi.RSSI());
 
-        WiFiClientSecure secureClient;
-        secureClient.setBufferSizes(512, 512);
-        secureClient.setInsecure();
+        Serial.printf("Heap before download: %u bytes\n", ESP.getFreeHeap());
+
+        WiFiClientSecure otaClient;
+        otaClient.setInsecure();
+        // CRITICAL FIX: Again, NO setBufferSizes() here. GitHub requires the full 16KB buffer.
 
         ESPhttpUpdate.rebootOnUpdate(true);
+        t_httpUpdate_return ret = ESPhttpUpdate.update(otaClient, "https://raw.githubusercontent.com/karthii12345/tech_ota/refs/heads/main/firmware.bin");
 
-        // --- EDIT THIS LINE: CHANGE 'YourUsername/techorc-iot-updates' TO YOUR DETAILS ---
-        t_httpUpdate_return ret = ESPhttpUpdate.update(
-            secureClient,
-            "https://raw.githubusercontent.com/karthii12345/tech_ota/refs/heads/main/firmware.bin");
-
-        // On success, device reboots immediately and this code is never reached.
-        switch (ret) {
-          case HTTP_UPDATE_FAILED: {
-            char errBuf[200];
-            snprintf(errBuf, sizeof(errBuf),
-                     "ERR: OTA Failed (code %d): %s. Free heap %u bytes, frag %u%%, RSSI %d dBm.",
-                     ESPhttpUpdate.getLastError(),
-                     ESPhttpUpdate.getLastErrorString().c_str(),
-                     ESP.getFreeHeap(), ESP.getHeapFragmentation(), WiFi.RSSI());
-            Serial.println(errBuf);
-            // tcpClient was stopped above on purpose — do not attempt tcpSend()
-            // here, it will silently fail. loop() will reconnect + re-auth
-            // automatically on the next iteration, and you'll see this reason
-            // on the Serial monitor.
-            break;
-          }
-          case HTTP_UPDATE_NO_UPDATES:
-            Serial.println(F("ERR: No updates found. Resuming normal operation."));
-            break;
-          case HTTP_UPDATE_OK:
-            break; // unreachable — device reboots instantly on success
+        // Fallback recovery
+        if (ret != HTTP_UPDATE_OK) {
+          Serial.printf("ERR: OTA Failed (code %d): %s.\n", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+          delay(1000);
+          ESP.restart(); // Clear fragmented memory and restart clean
         }
         continue;
       }
@@ -1569,11 +1494,11 @@ void loop() {
         bool relayOn = (digitalRead(RELAY_PIN) == LOW);
 
         const char* driver = "NONE";
-        if (manualOverrideON)                                                  driver = "MANUAL";
-        else if (deviceMode == 4 && dailySched.state == 1)                     driver = "DAILY";
-        else if ((deviceMode == 2 || deviceMode == 4) && autoTimerRunning)     driver = "AUTO";
+        if (manualOverrideON)                                              driver = "MANUAL";
+        else if (deviceMode == 4 && dailySched.state == 1)                 driver = "DAILY";
+        else if ((deviceMode == 2 || deviceMode == 4) && autoTimerRunning) driver = "AUTO";
         else if (deviceMode == 3 && schedule.active && schedule.hasTriggeredOn)driver = "CUSTOM";
-        else if (relayOn)                                                      driver = "MANUAL";
+        else if (relayOn)                                                  driver = "MANUAL";
 
         snprintf(ackBuf, sizeof(ackBuf),
                  "STATUS: DAILY:%s   LOAD:%s",
@@ -1679,10 +1604,6 @@ void loop() {
 
     if (runPirLogic) {
       if (millis() < 30000UL) {
-        // Track the sensor's REAL state during warm-up instead of forcing LOW.
-        // Forcing LOW caused a false rising-edge the instant warm-up ended if
-        // the PIR was still settling and happened to read HIGH at the 30s mark —
-        // the relay would then switch ON as if real motion had occurred.
         lastPirState = digitalRead(PIR_PIN);
         lastPirChangeTime = millis();
       } else {
