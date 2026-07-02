@@ -1,3 +1,30 @@
+// ═════════════════════════════════════════════════════════════
+//  BOARD: ESP-01S (1MB flash) — CRITICAL SETUP STEP
+// ═════════════════════════════════════════════════════════════
+//  OTA on a 1MB ESP-01S REQUIRES the correct flash size/partition
+//  scheme selected in Arduino IDE BEFORE compiling, or OTA will
+//  ALWAYS fail with "not enough space" no matter how clean the
+//  code is. This is a board-manager setting, not code:
+//
+//    Tools > Board            : Generic ESP8266 Module
+//    Tools > Flash Size       : 1M (FS:64KB, OTA:~470KB)
+//                               (name varies slightly by core version —
+//                                pick any "1M" option that reserves
+//                                two OTA app slots, NOT "1M (no OTA)")
+//    Tools > Reset Method     : ck / nodemcu (whichever your board needs)
+//
+//  If "1M (no OTA)" or "1M (FS:none OTA:~502KB)" without two OTA
+//  slots is selected, ESPhttpUpdate will fail immediately regardless
+//  of RAM or network — always double check this first.
+//
+//  Because flash is this tight, LittleFS is also small — this is
+//  why the code below is careful to NEVER write to flash during
+//  the OTA attempt itself (only RAM/state changes), and only
+//  writes flash for config changes that already existed in your
+//  original design (token, credentials, state file). No new flash
+//  writes were added by this fix.
+// ═════════════════════════════════════════════════════════════
+
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESPAsyncTCP.h>
@@ -12,7 +39,7 @@
 // ─────────────────────────────────────────────────────────────
 //  FIRMWARE VERSION
 // ─────────────────────────────────────────────────────────────
-#define CURRENT_VERSION "1.0.1"
+#define CURRENT_VERSION "1.0.0"
 
 // ─────────────────────────────────────────────────────────────
 //  FORWARD DECLARATIONS
@@ -22,6 +49,9 @@ struct DailySchedule;
 
 // ─────────────────────────────────────────────────────────────
 //  PIN DEFINITIONS
+//  NOTE (ESP-01S): only GPIO0 and GPIO2 are freely usable.
+//  GPIO3 is the RX pin — usable here ONLY because Serial is
+//  initialized as SERIAL_TX_ONLY below, freeing RX for PIR input.
 // ─────────────────────────────────────────────────────────────
 #define RELAY_PIN 0
 #define LED_PIN   2
@@ -31,13 +61,13 @@ struct DailySchedule;
 //  TCP CLIENT
 // ─────────────────────────────────────────────────────────────
 WiFiClient        tcpClient;
-const char*       serverIP   = "192.168.10.200"; // <--- CHANGE THIS
-const uint16_t    serverPort = 4455;              // <--- CHANGE THIS
+const char*       serverIP   = "192.168.10.00"; // <--- CHANGE THIS
+const uint16_t    serverPort = 44;              // <--- CHANGE THIS
 
 // ─────────────────────────────────────────────────────────────
 //  TOKEN / REGISTRATION
 // ─────────────────────────────────────────────────────────────
-const char* BUILT_IN_TOKEN = "135";
+const char* BUILT_IN_TOKEN = "15";
 char        activeToken[64];
 bool        isRegistered   = false;
 
@@ -83,10 +113,10 @@ const unsigned long WIFI_CHECK_MS  = 5000UL;
 uint8_t wifiDropCount              = 0;
 
 // ─────────────────────────────────────────────────────────────
-//  PERIODIC NTP RESYNC 
+//  PERIODIC NTP RESYNC
 // ─────────────────────────────────────────────────────────────
 unsigned long lastNtpSync         = 0;
-const unsigned long NTP_RESYNC_MS = 3600000UL; 
+const unsigned long NTP_RESYNC_MS = 3600000UL;
 
 // ─────────────────────────────────────────────────────────────
 //  PIR LOGIC
@@ -94,7 +124,7 @@ const unsigned long NTP_RESYNC_MS = 3600000UL;
 bool          lastPirState      = LOW;
 unsigned long lastPirChangeTime = 0;
 const unsigned long DEBOUNCE_MS = 300UL;
-bool          waitForPirLow     = false; 
+bool          waitForPirLow     = false;
 
 // ─────────────────────────────────────────────────────────────
 //  MANUAL OVERRIDE LATCH (RAM only, volatile)
@@ -105,6 +135,13 @@ bool          manualOverrideON  = false;
 //  OTA STATE (RAM only)
 // ─────────────────────────────────────────────────────────────
 bool          pendingOtaUpdate  = false;
+
+// Pre-computed once at boot (MAC never changes at runtime) instead of being
+// rebuilt with String allocations on EVERY line received over TCP. Rebuilding
+// these on every command fragmented the heap over time, which is the likely
+// cause of BearSSL's TLS handshake to GitHub dying mid-connection (-5).
+char myMacStr[16]           = "";  // e.g. "483FDA5CCA34"
+char targetUpdateCmdStr[32] = "";  // e.g. "483FDA5CCA34:UPDATE"
 
 // ─────────────────────────────────────────────────────────────
 //  MODE SYSTEM
@@ -151,7 +188,7 @@ struct DailySchedule {
   int  endHour,   endMin;
   bool active;
   bool configured;
-  int  state;      
+  int  state;
 };
 DailySchedule dailySched = {0, 0, 0, 0, false, false, 0};
 
@@ -167,7 +204,7 @@ AsyncWebServer server(80);
 
 bool          inSetupMode        = false;
 bool          triggerConnection  = false;
-int           portalState        = 0;  
+int           portalState        = 0;
 
 String tempSSID = "";
 String tempPASS = "";
@@ -214,7 +251,7 @@ void sendConfigReminderIfNeeded() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  INSTANT STATUS SYNC 
+//  INSTANT STATUS SYNC
 // ─────────────────────────────────────────────────────────────
 void sendStatusUpdate() {
   if (!isAuthenticated) return;
@@ -262,7 +299,7 @@ void changeMode(int newMode) {
     setRelay(false);
   }
   autoInCooldown = false;
-  waitForPirLow  = false; 
+  waitForPirLow  = false;
   char from[12], to[12], buf[64];
   modeName(deviceMode, from, sizeof(from));
   modeName(newMode,    to,   sizeof(to));
@@ -351,7 +388,7 @@ bool parseDailyCommand(const char* cmd, DailySchedule& s) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  FLASH LOGIC 
+//  FLASH LOGIC
 // ─────────────────────────────────────────────────────────────
 bool noteFlashWrite(const char* whatChanged) {
   if (flashWriteCount >= FLASH_DEAD_LIMIT) {
@@ -559,7 +596,7 @@ void loadState() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  HTML CAPTIVE PORTAL 
+//  HTML CAPTIVE PORTAL
 // ─────────────────────────────────────────────────────────────
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -753,8 +790,8 @@ void setup() {
   ESP.wdtEnable(8000);
 
   pinMode(LED_PIN,   OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH); 
-  digitalWrite(LED_PIN,   HIGH); 
+  digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(LED_PIN,   HIGH);
   pinMode(PIR_PIN,   INPUT);
   pinMode(RELAY_PIN, OUTPUT);
 
@@ -774,31 +811,34 @@ void setup() {
                    rinfo->excvaddr, rinfo->depc);
   }
 
-  // Print MAC Address clearly for OTA targeting
-  String myMac = WiFi.macAddress();
-  myMac.replace(":", "");
+  String bootMac = WiFi.macAddress();
+  bootMac.replace(":", "");
+  strncpy(myMacStr, bootMac.c_str(), sizeof(myMacStr) - 1);
+  myMacStr[sizeof(myMacStr) - 1] = '\0';
+  snprintf(targetUpdateCmdStr, sizeof(targetUpdateCmdStr), "%s:UPDATE", myMacStr);
+
   Serial.print(F("Device Unique ID (MAC for OTA): "));
-  Serial.println(myMac);
+  Serial.println(myMacStr);
   Serial.printf("Firmware Version: v%s\n", CURRENT_VERSION);
+  Serial.printf("Free heap at boot: %u bytes\n", ESP.getFreeHeap());
 
   lastPirState = digitalRead(PIR_PIN);
 
-  // ── ROBUST LittleFS MOUNTING (NEVER FORMAT) ──
   bool fsMounted = false;
   for (int i = 0; i < 10; i++) {
     if (LittleFS.begin()) {
       fsMounted = true;
-      break; 
+      break;
     }
     Serial.println(F("LittleFS mount failed due to power dip. Waiting 1s..."));
-    delay(1000); 
-    ESP.wdtFeed(); 
+    delay(1000);
+    ESP.wdtFeed();
   }
 
   if (!fsMounted) {
     Serial.println(F("CRITICAL: Flash memory not responding. Rebooting to try again..."));
     delay(1000);
-    ESP.restart(); 
+    ESP.restart();
   }
 
   loadToken();
@@ -816,7 +856,7 @@ void setup() {
 
   if (hasCredentials) {
     Serial.print(F("Saved SSID found: ")); Serial.println(savedSSID);
-    
+
     WiFi.mode(WIFI_STA);
     WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
 
@@ -832,7 +872,7 @@ void setup() {
       }
       delay(500);
     }
-    
+
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Boot connect timed out. Device will retry continuously in background."));
     }
@@ -850,7 +890,6 @@ void setup() {
 void loop() {
   ESP.wdtFeed();
 
-  // ── SOFTWARE WATCHDOG ──
   if (millis() - lastLoopExecution > MAX_LOOP_TIME) {
     Serial.println(F("SOFT-WDT: Logic frozen > 2 min. Restarting."));
     ESP.restart();
@@ -933,7 +972,6 @@ void loop() {
     }
   }
 
-  // ── PERIODIC NTP RESYNC ──
   if (WiFi.status() == WL_CONNECTED
       && millis() - lastNtpSync > NTP_RESYNC_MS) {
     lastNtpSync = millis();
@@ -941,7 +979,7 @@ void loop() {
     Serial.println(F("NTP: periodic resync triggered."));
   }
 
-  if (WiFi.status() != WL_CONNECTED) return; 
+  if (WiFi.status() != WL_CONNECTED) return;
 
   // ============================================================
   //  SECTION 2 — TCP SERVER CONNECTION
@@ -955,18 +993,18 @@ void loop() {
     unsigned long now = millis();
     if (now - lastReconnectAttempt >= reconnectBackoff) {
       lastReconnectAttempt = now;
-      tcpClient.stop(); 
+      tcpClient.stop();
 
       Serial.printf("Connecting to TCP Server %s:%d...\n", serverIP, serverPort);
       if (tcpClient.connect(serverIP, serverPort)) {
         tcpClient.setNoDelay(true);
         Serial.println(F("ONLINE"));
-        reconnectBackoff = RECONNECT_MIN; 
+        reconnectBackoff = RECONNECT_MIN;
 
         if (isRegistered) {
           isAuthenticated = true;
           tcpClient.println(F("ONLINE: Auto-Authenticated (Verified in Flash)."));
-          sendStatusUpdate();                
+          sendStatusUpdate();
           if (!isDeviceConfigured()) {
             tcpClient.println(F("REMINDER: Device not yet configured. Send -> auto:<mins>|daily:HH:MM,HH:MM"));
           }
@@ -990,7 +1028,7 @@ void loop() {
     if (c == '\n') {
       lineBuf[bufIdx] = '\0';
       int len = bufIdx;
-      bufIdx = 0; 
+      bufIdx = 0;
 
       while (len > 0 && (lineBuf[len - 1] == '\r' || lineBuf[len - 1] == ' ')) {
         lineBuf[--len] = '\0';
@@ -998,7 +1036,7 @@ void loop() {
       char* trimmedLine = lineBuf;
       while (*trimmedLine == ' ') trimmedLine++;
 
-      if (strlen(trimmedLine) == 0) continue; 
+      if (strlen(trimmedLine) == 0) continue;
 
       strncpy(upperBuf, trimmedLine, LINE_BUF_SZ - 1);
       upperBuf[LINE_BUF_SZ - 1] = '\0';
@@ -1006,87 +1044,128 @@ void loop() {
 
       // ────────────────────────────────────────────────────────
       //  SMART OTA UPDATE LOGIC (MAC Specific + Version Check)
+      //  myMacStr / targetUpdateCmdStr are computed ONCE at boot
+      //  (see setup()) instead of being rebuilt with String
+      //  allocations on every single line received — repeated
+      //  alloc/free here was fragmenting the heap over time, which
+      //  is the likely cause of the BearSSL handshake to GitHub
+      //  dying mid-connection (HTTP code -5) even when total free
+      //  heap looked fine in STATUS.
       // ────────────────────────────────────────────────────────
-      String myMac = WiFi.macAddress();
-      myMac.replace(":", ""); 
-      String targetUpdateCmd = myMac + ":UPDATE";
-      
-      if (strcmp(upperBuf, targetUpdateCmd.c_str()) == 0) {
+      if (strcmp(upperBuf, targetUpdateCmdStr) == 0) {
         char msgBuf[128];
-        snprintf(msgBuf, sizeof(msgBuf), "ACK: Target match (%s). Checking GitHub for firmware...", myMac.c_str());
+        snprintf(msgBuf, sizeof(msgBuf), "ACK: Target match (%s). Checking GitHub for firmware...", myMacStr);
         tcpSend(msgBuf);
-        
+
+        Serial.printf("Free heap before version check: %u bytes | Fragmentation: %u%% | RSSI: %d dBm\n",
+                       ESP.getFreeHeap(), ESP.getHeapFragmentation(), WiFi.RSSI());
+
         WiFiClientSecure secureClient;
-        secureClient.setInsecure(); // Trust GitHub HTTPS
+        secureClient.setBufferSizes(512, 512); // shrink TLS buffers — ESP-01S is very tight on RAM
+        secureClient.setInsecure();
         HTTPClient http;
-        
+
         // --- EDIT THIS LINE: CHANGE 'YourUsername/techorc-iot-updates' TO YOUR DETAILS ---
         http.begin(secureClient, "https://raw.githubusercontent.com/karthii12345/tech_ota/refs/heads/main/version.txt");
         int httpCode = http.GET();
-        
+
         if (httpCode == HTTP_CODE_OK) {
           String latestVersion = http.getString();
           latestVersion.trim();
-          
+
           char buf[128];
-          // Smart Version Check: Protects against redundant downloads
           if (latestVersion == String(CURRENT_VERSION)) {
             snprintf(buf, sizeof(buf), "UPDATE_READY: Device is already up to date (v%s). No update needed.", CURRENT_VERSION);
             tcpSend(buf);
-            pendingOtaUpdate = false; 
+            pendingOtaUpdate = false;
           } else {
             snprintf(buf, sizeof(buf), "UPDATE_READY: Current v%s -> New v%s. Send YES to install.", CURRENT_VERSION, latestVersion.c_str());
             tcpSend(buf);
-            pendingOtaUpdate = true; // Arm the YES command
+            pendingOtaUpdate = true;
           }
         } else {
-          tcpSend("ERR: Failed to reach GitHub or version file not found.");
+          char ebuf[96];
+          snprintf(ebuf, sizeof(ebuf), "ERR: Failed to reach GitHub (HTTP code %d) or version file not found.", httpCode);
+          tcpSend(ebuf);
+          Serial.println(ebuf);
         }
         http.end();
         continue;
       }
 
-      // Execute the OTA Update upon receiving YES
+      // ────────────────────────────────────────────────────────
+      //  EXECUTE OTA UPDATE ON "YES"
+      //  Fixes applied vs original:
+      //   1. tcpClient.stop() BEFORE the HTTPS call — frees the
+      //      control-server socket's RAM so BearSSL has room.
+      //   2. setBufferSizes(512,512) — shrinks BearSSL's default
+      //      ~10KB TLS buffer footprint to ~1KB, critical on
+      //      ESP-01S / low-heap situations.
+      //   3. Free-heap logged to Serial before the attempt, so you
+      //      can see directly whether RAM was the limiting factor.
+      //   4. Failure reason logged to Serial (not tcpSend), since
+      //      tcpClient is already stopped by this point and any
+      //      tcpSend() call here would silently do nothing.
+      //   5. No flash writes occur anywhere in this block — matches
+      //      your requirement of not wearing flash during OTA.
+      // ────────────────────────────────────────────────────────
       if (pendingOtaUpdate && strcmp(upperBuf, "YES") == 0) {
         pendingOtaUpdate = false;
-        
-        // SAFETY FIRST: Pause all timers and shut OFF relay before CPU freezes
+
+        // Safety first: pause all timers, relay OFF (RAM only, no flash write)
         changeMode(0);
         schedule.active   = false;
         dailySched.active = false;
         autoTimerRunning  = false;
         manualOverrideON  = false;
         setRelay(false);
-        
+
         tcpSend("ACK: Starting firmware download... Device will be unresponsive for 30 seconds.");
         tcpSend("STATUS: If successful, connection will drop and device will reboot.");
-        delay(500); 
+        delay(500);
+
+        // ── Free RAM before attempting HTTPS OTA ──
+        tcpClient.stop();
+        isAuthenticated = false;
+        Serial.printf("Free heap before OTA attempt: %u bytes | Fragmentation: %u%% | RSSI: %d dBm\n",
+                       ESP.getFreeHeap(), ESP.getHeapFragmentation(), WiFi.RSSI());
 
         WiFiClientSecure secureClient;
-        secureClient.setInsecure(); 
-        
-        // --- EDIT THIS LINE: CHANGE 'YourUsername/techorc-iot-updates' TO YOUR DETAILS ---
-        t_httpUpdate_return ret = ESPhttpUpdate.update(secureClient, "https://raw.githubusercontent.com/karthii12345/tech_ota/refs/heads/main/firmware.bin");
+        secureClient.setBufferSizes(512, 512);
+        secureClient.setInsecure();
 
+        ESPhttpUpdate.rebootOnUpdate(true);
+
+        // --- EDIT THIS LINE: CHANGE 'YourUsername/techorc-iot-updates' TO YOUR DETAILS ---
+        t_httpUpdate_return ret = ESPhttpUpdate.update(
+            secureClient,
+            "https://raw.githubusercontent.com/karthii12345/tech_ota/refs/heads/main/firmware.bin");
+
+        // On success, device reboots immediately and this code is never reached.
         switch (ret) {
-          case HTTP_UPDATE_FAILED:
-            char errBuf[128];
-            snprintf(errBuf, sizeof(errBuf), "ERR: Update Failed. HTTP Error: %s. Resuming normal operation.", ESPhttpUpdate.getLastErrorString().c_str());
-            tcpSend(errBuf);
+          case HTTP_UPDATE_FAILED: {
+            char errBuf[200];
+            snprintf(errBuf, sizeof(errBuf),
+                     "ERR: OTA Failed (code %d): %s. Free heap %u bytes, frag %u%%, RSSI %d dBm.",
+                     ESPhttpUpdate.getLastError(),
+                     ESPhttpUpdate.getLastErrorString().c_str(),
+                     ESP.getFreeHeap(), ESP.getHeapFragmentation(), WiFi.RSSI());
+            Serial.println(errBuf);
+            // tcpClient was stopped above on purpose — do not attempt tcpSend()
+            // here, it will silently fail. loop() will reconnect + re-auth
+            // automatically on the next iteration, and you'll see this reason
+            // on the Serial monitor.
             break;
-            
+          }
           case HTTP_UPDATE_NO_UPDATES:
-            tcpSend("ERR: No updates found. Resuming normal operation.");
+            Serial.println(F("ERR: No updates found. Resuming normal operation."));
             break;
-            
           case HTTP_UPDATE_OK:
-            // Never reached (reboots instantly on success)
-            break;
+            break; // unreachable — device reboots instantly on success
         }
         continue;
       }
 
-      // Clear pending update if they type something other than YES
       if (pendingOtaUpdate) {
         pendingOtaUpdate = false;
         tcpSend("ACK: Update cancelled. Normal command processing resumed.");
@@ -1115,7 +1194,7 @@ void loop() {
           pendingReset = false;
           tcpSend("ERR: Invalid Token. Reset aborted. System returned to normal operation.");
         }
-        continue; 
+        continue;
       }
 
       // ────────────────────────────────────────────────────────
@@ -1133,13 +1212,13 @@ void loop() {
           } else {
             tcpSend("ACK: Authenticated successfully.");
           }
-          sendStatusUpdate();                
+          sendStatusUpdate();
           sendConfigReminderIfNeeded();
         } else {
           tcpSend("ERR: Invalid Token. Send only the token value (no prefix).");
           tcpClient.stop();
         }
-        continue; 
+        continue;
       }
 
       // ────────────────────────────────────────────────────────
@@ -1147,7 +1226,6 @@ void loop() {
       // ────────────────────────────────────────────────────────
       char ackBuf[128];
 
-      // 1. COMBINED CONFIG  auto:<mins>|daily:HH:MM,HH:MM
       char* pipe = strchr(upperBuf, '|');
       if (pipe && strncmp(upperBuf, "AUTO:", 5) == 0) {
         size_t pipeIdx = (size_t)(pipe - upperBuf);
@@ -1200,7 +1278,7 @@ void loop() {
               autoTimerRunning    = false;
               setRelay(false);
             }
-            waitForPirLow = false; // clear blocker
+            waitForPirLow = false;
             saveState("combined-config");
 
             char modeBuf[12];
@@ -1219,7 +1297,6 @@ void loop() {
         continue;
       }
 
-      // 2. TOKEN CHANGE:<new_token>
       if (strncmp(upperBuf, "TOKEN CHANGE:", 13) == 0) {
         char* newTok = trimmedLine + 13;
         while (*newTok == ' ') newTok++;
@@ -1237,7 +1314,6 @@ void loop() {
         continue;
       }
 
-      // 3. AUTO CHANGE:<minutes>
       if (strncmp(upperBuf, "AUTO CHANGE:", 12) == 0) {
         int mins = atoi(trimmedLine + 12);
         if (mins <= 0) {
@@ -1254,7 +1330,6 @@ void loop() {
         continue;
       }
 
-      // 4. DAILY CHANGE:HH:MM,HH:MM
       if (strncmp(upperBuf, "DAILY CHANGE:", 13) == 0) {
         DailySchedule ns = {0, 0, 0, 0, false, false, 0};
         if (!parseDailyCommand(trimmedLine, ns)) {
@@ -1279,15 +1354,11 @@ void loop() {
         continue;
       }
 
-      // ──────────────────────────────────────────────────────
-      //  5-8. INDEPENDENT SUB-TOGGLES 
-      // ──────────────────────────────────────────────────────
-      // 5. AUTO:ON  
       if (strcmp(upperBuf, "AUTO:ON") == 0) {
         if (autoTimerDuration == 0) {
           tcpSend("ERR: No AUTO timer saved. Use AUTO CHANGE:<mins> first.");
         } else {
-          if (deviceMode != 4) deviceMode = 4; 
+          if (deviceMode != 4) deviceMode = 4;
           waitForPirLow      = false;
           lastPirState       = digitalRead(PIR_PIN);
           lastPirChangeTime  = millis();
@@ -1299,9 +1370,8 @@ void loop() {
         continue;
       }
 
-      // 6. AUTO:STOP 
       if (strcmp(upperBuf, "AUTO:STOP") == 0) {
-        autoTimerDuration = 0;      
+        autoTimerDuration = 0;
         autoTimerRunning  = false;
         if (!manualOverrideON && dailySched.state != 1) setRelay(false);
         saveState("auto-pause");
@@ -1311,14 +1381,13 @@ void loop() {
         continue;
       }
 
-      // 7. DAILY:ON 
       if (strcmp(upperBuf, "DAILY:ON") == 0) {
         if (!dailySched.configured) {
           tcpSend("ERR: No DAILY schedule saved. Set one first.");
         } else {
           if (deviceMode != 4) deviceMode = 4;
           dailySched.active = true;
-          dailySched.state  = 0; 
+          dailySched.state  = 0;
           saveState("daily-resume");
           tcpSend("ACK: Daily Clock ACTIVATED. Motion Sensor remains unchanged.");
           isAuthenticated = false;
@@ -1327,7 +1396,6 @@ void loop() {
         continue;
       }
 
-      // 8. DAILY:STOP 
       if (strcmp(upperBuf, "DAILY:STOP") == 0) {
         dailySched.active = false;
         dailySched.state  = 0;
@@ -1339,9 +1407,6 @@ void loop() {
         continue;
       }
 
-      // ──────────────────────────────────────────────────────
-      //  RAM COMMANDS (VOLATILE — no flash writes)
-      // ──────────────────────────────────────────────────────
       if (strcmp(upperBuf, "STOP") == 0) {
         changeMode(0);
         schedule.active   = false;
@@ -1353,14 +1418,11 @@ void loop() {
         continue;
       }
 
-      // ──────────────────────────────────────────────────────
-      //  TRUE LATCHING MANUAL COMMANDS (RAM only, volatile)
-      // ──────────────────────────────────────────────────────
       if (strcmp(upperBuf, "OFF") == 0) {
-        manualOverrideON = false; 
+        manualOverrideON = false;
         if (deviceMode == 4) {
           if (dailySched.state == 1) {
-            dailySched.state = 2; // skip until tomorrow
+            dailySched.state = 2;
             autoTimerRunning = false;
             setRelay(false);
             waitForPirLow = true;
@@ -1469,10 +1531,6 @@ void loop() {
         continue;
       }
 
-      // ──────────────────────────────────────────────────────
-      //  SYSTEM & DIAGNOSTIC COMMANDS
-      // ──────────────────────────────────────────────────────
-      
       if (strcmp(upperBuf, "RESET") == 0) {
         pendingReset = true;
         tcpSend("REQUEST: Warning! This will erase all Wi-Fi and Security data. Send your token now to confirm.");
@@ -1515,7 +1573,7 @@ void loop() {
         else if (deviceMode == 4 && dailySched.state == 1)                     driver = "DAILY";
         else if ((deviceMode == 2 || deviceMode == 4) && autoTimerRunning)     driver = "AUTO";
         else if (deviceMode == 3 && schedule.active && schedule.hasTriggeredOn)driver = "CUSTOM";
-        else if (relayOn)                                                      driver = "MANUAL"; // ON in Mode 0
+        else if (relayOn)                                                      driver = "MANUAL";
 
         snprintf(ackBuf, sizeof(ackBuf),
                  "STATUS: DAILY:%s   LOAD:%s",
@@ -1537,8 +1595,11 @@ void loop() {
                  flashWriteCount, (unsigned long)percent);
         tcpSend(ackBuf);
 
-        // SMART FIRMWARE VERSION PRINT
         snprintf(ackBuf, sizeof(ackBuf), "STATUS: FIRMWARE VERSION: v%s", CURRENT_VERSION);
+        tcpSend(ackBuf);
+
+        snprintf(ackBuf, sizeof(ackBuf), "STATUS: FREE HEAP: %u bytes | FRAG: %u%% | RSSI: %d dBm",
+                 ESP.getFreeHeap(), ESP.getHeapFragmentation(), WiFi.RSSI());
         tcpSend(ackBuf);
         continue;
       }
@@ -1555,7 +1616,6 @@ void loop() {
     }
   }
 
-  // ── SILENT HEARTBEAT ──
   run_modes:
 
   if (isAuthenticated && millis() - lastHeartbeatTime > HEARTBEAT_MS) {
@@ -1569,7 +1629,6 @@ void loop() {
   //  SECTION 4 — MODE EXECUTION
   // ============================================================
 
-  // ── MODE 2 & 4: AUTO_TIMED & DAILY HYBRID ──
   if (deviceMode == 2 || (deviceMode == 4 && dailySched.active)) {
 
     bool inDailyWindow = false;
@@ -1619,25 +1678,26 @@ void loop() {
     }
 
     if (runPirLogic) {
-      // 1. HARDWARE WARM-UP BLOCK
       if (millis() < 30000UL) {
-        lastPirState = LOW;
-        lastPirChangeTime = millis(); 
+        // Track the sensor's REAL state during warm-up instead of forcing LOW.
+        // Forcing LOW caused a false rising-edge the instant warm-up ended if
+        // the PIR was still settling and happened to read HIGH at the 30s mark —
+        // the relay would then switch ON as if real motion had occurred.
+        lastPirState = digitalRead(PIR_PIN);
+        lastPirChangeTime = millis();
       } else {
         bool pir = digitalRead(PIR_PIN);
 
-        // 2. TRUE EDGE-TRIGGERED DEBOUNCE (EMI PROTECTION)
         if (pir != lastPirState) {
           if (millis() - lastPirChangeTime > DEBOUNCE_MS) {
-            
+
             lastPirState = pir;
             lastPirChangeTime = millis();
 
             if (pir == LOW) {
-              waitForPirLow = false; 
+              waitForPirLow = false;
             }
 
-            // 3. TRIGGER ONLY ON RISING EDGE
             if (pir == HIGH && !autoTimerRunning && !autoInCooldown && !waitForPirLow && !manualOverrideON) {
               setRelay(true);
               autoTimerRunning   = true;
@@ -1657,14 +1717,12 @@ void loop() {
         }
       }
 
-      // 4. COOLDOWN HANDLER
       if (autoInCooldown) {
         if (millis() - autoCooldownStart >= AUTO_COOLDOWN_MS) {
           autoInCooldown = false;
         }
       }
 
-      // 5. TIMER EXPIRATION
       if (autoTimerRunning && millis() - autoTimerStartTime >= autoTimerDuration) {
         autoTimerRunning = false;
         setRelay(false);
@@ -1675,7 +1733,6 @@ void loop() {
     }
   }
 
-  // ── MODE 3: CUSTOM ──
   else if (deviceMode == 3 && schedule.active) {
     time_t nowT = time(nullptr);
     struct tm* t = localtime(&nowT);
