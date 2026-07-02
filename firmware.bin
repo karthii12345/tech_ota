@@ -1061,7 +1061,7 @@ void loop() {
                        ESP.getFreeHeap(), ESP.getHeapFragmentation(), WiFi.RSSI());
 
         WiFiClientSecure secureClient;
-        secureClient.setBufferSizes(512, 512); // shrink TLS buffers — ESP-01S is very tight on RAM
+        secureClient.setBufferSizes(4096, 512); // shrink TLS buffers — ESP-01S is very tight on RAM
         secureClient.setInsecure();
         HTTPClient http;
 
