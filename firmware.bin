@@ -1,2 +1,1641 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
+#include <LittleFS.h>
+#include <time.h>
 
-llllhjl
+// ── OTA INCLUDES ──
+#include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
+#include <WiFiClientSecure.h>
+
+// ─────────────────────────────────────────────────────────────
+//  FIRMWARE VERSION & OTA CONFIGURATION
+// ─────────────────────────────────────────────────────────────
+#define CURRENT_VERSION "1.0.1"
+
+// URLs pointing to the public folder on your raw GitHub repository
+const char* versionURL = "https://github.com/karthii12345/tech_ota/blob/main/verstion.txt";
+const char* firmwareURL = "https://github.com/karthii12345/tech_ota/blob/main/firmware.bin";
+
+bool pendingOTA = false; 
+
+// ─────────────────────────────────────────────────────────────
+//  FORWARD DECLARATIONS
+// ─────────────────────────────────────────────────────────────
+struct CustomSchedule;
+struct DailySchedule;
+void checkForUpdate();
+void performOTA();
+
+// ─────────────────────────────────────────────────────────────
+//  PIN DEFINITIONS
+// ─────────────────────────────────────────────────────────────
+#define RELAY_PIN 0
+#define LED_PIN   2
+#define PIR_PIN   3
+
+// ─────────────────────────────────────────────────────────────
+//  TCP CLIENT
+// ─────────────────────────────────────────────────────────────
+WiFiClient        tcpClient;
+const char*       serverIP   = "192.168.10.200";
+const uint16_t    serverPort = 4455;
+
+// ─────────────────────────────────────────────────────────────
+//  TOKEN / REGISTRATION
+// ─────────────────────────────────────────────────────────────
+const char* BUILT_IN_TOKEN = "135";
+char        activeToken[64];
+bool        isRegistered   = false;
+
+// ─────────────────────────────────────────────────────────────
+//  COMMAND LINE BUFFER
+// ─────────────────────────────────────────────────────────────
+#define LINE_BUF_SZ 192
+char lineBuf[LINE_BUF_SZ];
+char upperBuf[LINE_BUF_SZ];
+static int bufIdx = 0;
+
+// ─────────────────────────────────────────────────────────────
+//  FLASH WEAR TRACKING
+// ─────────────────────────────────────────────────────────────
+unsigned long flashWriteCount        = 0;
+const unsigned long FLASH_ALERT_50   = 45000UL;
+const unsigned long FLASH_HARD_LIMIT = 85000UL;
+const unsigned long FLASH_DEAD_LIMIT = 90000UL;
+
+// ─────────────────────────────────────────────────────────────
+//  TCP / AUTH STATE
+// ─────────────────────────────────────────────────────────────
+bool          isAuthenticated      = false;
+bool          pendingReset         = false;
+unsigned long lastReconnectAttempt = 0;
+unsigned long reconnectBackoff     = 5000UL;
+const unsigned long RECONNECT_MIN  = 5000UL;
+const unsigned long RECONNECT_MAX  = 120000UL;
+unsigned long lastHeartbeatTime    = 0;
+const unsigned long HEARTBEAT_MS   = 25000UL;
+
+// ─────────────────────────────────────────────────────────────
+//  SOFT WATCHDOG
+// ─────────────────────────────────────────────────────────────
+unsigned long lastLoopExecution    = 0;
+const unsigned long MAX_LOOP_TIME  = 120000UL;
+
+// ─────────────────────────────────────────────────────────────
+//  WIFI HEALTH
+// ─────────────────────────────────────────────────────────────
+unsigned long lastWifiCheck        = 0;
+const unsigned long WIFI_CHECK_MS  = 5000UL;
+uint8_t wifiDropCount              = 0;
+
+// ─────────────────────────────────────────────────────────────
+//  PERIODIC NTP RESYNC 
+// ─────────────────────────────────────────────────────────────
+unsigned long lastNtpSync         = 0;
+const unsigned long NTP_RESYNC_MS = 3600000UL; 
+
+// ─────────────────────────────────────────────────────────────
+//  PIR LOGIC
+// ─────────────────────────────────────────────────────────────
+bool          lastPirState      = LOW;
+unsigned long lastPirChangeTime = 0;
+const unsigned long DEBOUNCE_MS = 300UL;
+bool          waitForPirLow     = false; 
+
+// ─────────────────────────────────────────────────────────────
+//  MODE SYSTEM
+// ─────────────────────────────────────────────────────────────
+int deviceMode = 0;
+// 0=MANUAL  1=UNUSED  2=AUTO_TIMED  3=CUSTOM  4=DAILY
+
+const char MODE_MANUAL[] PROGMEM = "MANUAL";
+const char MODE_UNUSED[] PROGMEM = "UNUSED";
+const char MODE_AUTOT[]  PROGMEM = "AUTO_TIMED";
+const char MODE_CUSTOM[] PROGMEM = "CUSTOM";
+const char MODE_DAILY[]  PROGMEM = "DAILY";
+const char* const MODE_NAMES[] PROGMEM = {
+  MODE_MANUAL, MODE_UNUSED, MODE_AUTOT, MODE_CUSTOM, MODE_DAILY
+};
+
+void modeName(int mode, char* out, size_t outSz) {
+  strncpy_P(out, (PGM_P)pgm_read_ptr(&MODE_NAMES[mode]), outSz - 1);
+  out[outSz - 1] = '\0';
+}
+
+unsigned long autoTimerDuration  = 0;
+bool          autoTimerRunning   = false;
+unsigned long autoTimerStartTime = 0;
+
+const unsigned long AUTO_COOLDOWN_MS = 3000UL;
+unsigned long autoCooldownStart      = 0;
+bool          autoInCooldown         = false;
+
+// ─────────────────────────────────────────────────────────────
+//  SCHEDULES
+// ─────────────────────────────────────────────────────────────
+struct CustomSchedule {
+  int  year, month, day;
+  int  startHour, startMin;
+  int  endHour,   endMin;
+  bool active;
+  bool hasTriggeredOn;
+};
+CustomSchedule schedule = {0, 0, 0, 0, 0, 0, 0, false, false};
+
+struct DailySchedule {
+  int  startHour, startMin;
+  int  endHour,   endMin;
+  bool active;
+  bool configured;
+  int  state;      // 0=idle  1=window-ON  2=skipped-until-tomorrow
+};
+DailySchedule dailySched = {0, 0, 0, 0, false, false, 0};
+
+// ─────────────────────────────────────────────────────────────
+//  PORTAL STATE
+// ─────────────────────────────────────────────────────────────
+const byte  DNS_PORT = 53;
+const char* AP_PASS  = "12345678";
+char global_AP_Name[32] = "";
+
+DNSServer      dnsServer;
+AsyncWebServer server(80);
+
+bool          inSetupMode        = false;
+bool          triggerConnection  = false;
+int           portalState        = 0; 
+
+String tempSSID = "";
+String tempPASS = "";
+
+bool          connectionGraceActive = false;
+unsigned long connectionSuccessTime = 0;
+const unsigned long GRACE_PERIOD_MS  = 8000UL;
+unsigned long setupStartTime         = 0;
+const unsigned long SETUP_TIMEOUT_MS = 600000UL;
+unsigned long connectionStartTime    = 0;
+
+// ─────────────────────────────────────────────────────────────
+//  HELPERS
+// ─────────────────────────────────────────────────────────────
+bool tcpSend(const char* msg) {
+  if (!tcpClient.connected()) return false;
+  size_t written = tcpClient.println(msg);
+  if (written == 0) {
+    tcpClient.stop();
+    isAuthenticated = false;
+    pendingReset = false;
+    return false;
+  }
+  return true;
+}
+
+void setRelay(bool on) {
+  digitalWrite(RELAY_PIN, on ? LOW  : HIGH);
+  digitalWrite(LED_PIN,   on ? LOW  : HIGH);
+}
+
+bool isDeviceConfigured() {
+  return (autoTimerDuration > 0) || dailySched.active || dailySched.configured || schedule.active || (deviceMode != 0);
+}
+
+void sendConfigReminderIfNeeded() {
+  if (!isDeviceConfigured()) {
+    tcpSend("REMINDER: Device not yet configured. Send -> auto:<mins>|daily:HH:MM,HH:MM");
+  }
+}
+
+void sendStatusUpdate() {
+  if (!isAuthenticated) return;
+
+  bool relayOn = (digitalRead(RELAY_PIN) == LOW);
+  char modeBuf[12];
+  modeName(deviceMode, modeBuf, sizeof(modeBuf));
+
+  char buf[220];
+  snprintf(buf, sizeof(buf),
+           "SYNC: Mode=%s Relay=%s FlashWrites=(%lu/90k) AUTO=%s(%lumin) AutoRunning=%s DAILY=%s/conf=%s(%02d:%02d-%02d:%02d) DailyState=%d Configured=%s Version=%s",
+           modeBuf, relayOn ? "ON" : "OFF", flashWriteCount,
+           (autoTimerDuration > 0 ? "SET" : "UNSET"), autoTimerDuration / 60000UL,
+           (autoTimerRunning ? "YES" : "NO"),
+           (dailySched.active     ? "ACTIVE"   : "INACTIVE"),
+           (dailySched.configured ? "YES"      : "NO"),
+           dailySched.startHour, dailySched.startMin, dailySched.endHour,   dailySched.endMin,
+           dailySched.state, (isDeviceConfigured() ? "YES" : "NO"), CURRENT_VERSION);
+  tcpSend(buf);
+
+  if (deviceMode == 3 && schedule.active) {
+    char cbuf[110];
+    snprintf(cbuf, sizeof(cbuf),
+             "SYNC: CUSTOM Date=%02d/%02d/%04d Window=%02d:%02d-%02d:%02d Triggered=%s",
+             schedule.day, schedule.month, schedule.year,
+             schedule.startHour, schedule.startMin, schedule.endHour,   schedule.endMin,
+             (schedule.hasTriggeredOn ? "YES" : "NO"));
+    tcpSend(cbuf);
+  }
+}
+
+void changeMode(int newMode) {
+  if (deviceMode == newMode) return;
+  if ((deviceMode == 2 || deviceMode == 4) && autoTimerRunning) {
+    autoTimerRunning = false;
+    setRelay(false);
+  }
+  autoInCooldown = false;
+  waitForPirLow  = false; 
+  char from[12], to[12], buf[64];
+  modeName(deviceMode, from, sizeof(from));
+  modeName(newMode,    to,   sizeof(to));
+  deviceMode = newMode;
+  snprintf(buf, sizeof(buf), "EVENT: [%s]->[%s]", from, to);
+  Serial.println(buf);
+  if (isAuthenticated) tcpSend(buf);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  PARSERS 
+// ─────────────────────────────────────────────────────────────
+int parseAutoMinutes(const char* cmd) {
+  const char* colon = strchr(cmd, ':');
+  if (!colon) return 0;
+  return atoi(colon + 1);
+}
+
+bool parseCustomCommand(const char* cmd, CustomSchedule& s) {
+  const char* colon = strchr(cmd, ':');
+  if (!colon) return false;
+  char rest[96];
+  strncpy(rest, colon + 1, sizeof(rest) - 1);
+  rest[sizeof(rest) - 1] = '\0';
+
+  for (char* p = rest; *p; ++p) if (*p == ',') *p = ';';
+  char* trimmed = rest;
+  while (*trimmed == ' ') trimmed++;
+
+  char* s1 = strchr(trimmed, ';'); if (!s1) return false; *s1 = '\0';
+  char* s2 = strchr(s1 + 1, ';'); if (!s2) return false; *s2 = '\0';
+  char* datePart  = trimmed;
+  char* startPart = s1 + 1;
+  char* endPart   = s2 + 1;
+  while (*startPart == ' ') startPart++;
+  while (*endPart   == ' ') endPart++;
+
+  char* d1 = strchr(datePart, '/'); if (!d1) return false;
+  char* d2 = strchr(d1 + 1,   '/'); if (!d2) return false;
+  *d1 = '\0'; *d2 = '\0';
+  s.day   = atoi(datePart);
+  s.month = atoi(d1 + 1);
+  s.year  = atoi(d2 + 1);
+
+  char* t1 = strchr(startPart, ':'); if (!t1) return false; *t1 = '\0';
+  s.startHour = atoi(startPart);
+  s.startMin  = atoi(t1 + 1);
+
+  char* t2 = strchr(endPart, ':'); if (!t2) return false; *t2 = '\0';
+  s.endHour = atoi(endPart);
+  s.endMin  = atoi(t2 + 1);
+
+  s.active         = true;
+  s.hasTriggeredOn = false;
+  return true;
+}
+
+bool parseDailyCommand(const char* cmd, DailySchedule& s) {
+  const char* colon = strchr(cmd, ':');
+  if (!colon) return false;
+  char rest[64];
+  strncpy(rest, colon + 1, sizeof(rest) - 1);
+  rest[sizeof(rest) - 1] = '\0';
+
+  char* trimmed = rest;
+  while (*trimmed == ' ') trimmed++;
+
+  char* comma = strchr(trimmed, ','); if (!comma) return false;
+  *comma = '\0';
+  char* startPart = trimmed;
+  char* endPart   = comma + 1;
+  while (*endPart == ' ') endPart++;
+
+  char* t1 = strchr(startPart, ':'); if (!t1) return false; *t1 = '\0';
+  s.startHour = atoi(startPart);
+  s.startMin  = atoi(t1 + 1);
+
+  char* t2 = strchr(endPart, ':'); if (!t2) return false; *t2 = '\0';
+  s.endHour = atoi(endPart);
+  s.endMin  = atoi(t2 + 1);
+
+  s.active     = true;
+  s.configured = true;
+  s.state      = 0;
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  FLASH COUNTER 
+// ─────────────────────────────────────────────────────────────
+bool noteFlashWrite(const char* whatChanged) {
+  if (flashWriteCount >= FLASH_DEAD_LIMIT) {
+    Serial.println(F("CRITICAL: Flash write blocked! Max wear limit reached."));
+    if (isAuthenticated) {
+      tcpSend("CRITICAL: Flash write blocked to prevent hardware failure (90k limit). Setting applied to RAM only.");
+    }
+    return false;
+  }
+
+  flashWriteCount++;
+  char buf[80];
+  snprintf(buf, sizeof(buf), "EVENT: Flash write (%s) count=%lu/90k", whatChanged, flashWriteCount);
+  Serial.println(buf);
+  if (isAuthenticated) tcpSend(buf);
+
+  if (flashWriteCount == FLASH_ALERT_50) {
+    if (isAuthenticated) tcpSend("ALERT: Flash memory wear has reached ~50% (45000/90000)!");
+  }
+  if (flashWriteCount == FLASH_HARD_LIMIT) {
+    if (isAuthenticated) tcpSend("ALERT: Flash wear near limit (85000/90000) — config writes still allowed but consider reducing change frequency.");
+  }
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  FILE SYSTEM
+// ─────────────────────────────────────────────────────────────
+void loadToken() {
+  strncpy(activeToken, BUILT_IN_TOKEN, sizeof(activeToken) - 1);
+  activeToken[sizeof(activeToken) - 1] = '\0';
+
+  File f = LittleFS.open("/token.txt", "r");
+  if (f) {
+    String t = f.readStringUntil('\n'); t.trim();
+    if (t.length() > 0 && t.length() < sizeof(activeToken)) {
+      strncpy(activeToken, t.c_str(), sizeof(activeToken) - 1);
+      activeToken[sizeof(activeToken) - 1] = '\0';
+    }
+    String cStr = f.readStringUntil('\n'); cStr.trim();
+    if (cStr.length() > 0) {
+      unsigned long c = (unsigned long)cStr.toInt();
+      if (c > flashWriteCount) flashWriteCount = c;
+    }
+    f.close();
+  }
+
+  File reg = LittleFS.open("/registered.txt", "r");
+  if (reg) {
+    isRegistered = true;
+    reg.readStringUntil('\n');
+    String cStr = reg.readStringUntil('\n'); cStr.trim();
+    if (cStr.length() > 0) {
+      unsigned long c = (unsigned long)cStr.toInt();
+      if (c > flashWriteCount) flashWriteCount = c;
+    }
+    reg.close();
+  }
+}
+
+void unifyFlashCount() {
+  File f = LittleFS.open("/token.txt", "r");
+  if (!f) return;
+  String tok = f.readStringUntil('\n'); tok.trim();
+  f.close();
+  if (tok.length() == 0) return;
+
+  File fw = LittleFS.open("/token.txt", "w");
+  if (fw) {
+    fw.println(tok);
+    fw.println(flashWriteCount);
+    fw.close();
+  }
+}
+
+void saveToken(const char* newToken) {
+  if (!noteFlashWrite("token")) {
+    strncpy(activeToken, newToken, sizeof(activeToken) - 1);
+    activeToken[sizeof(activeToken) - 1] = '\0';
+    return;
+  }
+
+  File f = LittleFS.open("/token.txt", "w");
+  if (f) {
+    f.println(newToken);
+    f.println(flashWriteCount);
+    f.close();
+    strncpy(activeToken, newToken, sizeof(activeToken) - 1);
+    activeToken[sizeof(activeToken) - 1] = '\0';
+  }
+}
+
+bool loadCredentials(String& ssid, String& pass) {
+  File f = LittleFS.open("/cfg.txt", "r");
+  if (!f) return false;
+  ssid = f.readStringUntil('\n'); ssid.trim();
+  pass = f.readStringUntil('\n'); pass.trim();
+  String cStr = f.readStringUntil('\n'); cStr.trim();
+  if (cStr.length() > 0) {
+    unsigned long c = (unsigned long)cStr.toInt();
+    if (c > flashWriteCount) flashWriteCount = c;
+  }
+  f.close();
+  return (ssid.length() > 0);
+}
+
+void saveCredentials(const String& ssid, const String& pass) {
+  String existSSID, existPASS;
+  File f_check = LittleFS.open("/cfg.txt", "r");
+  if (f_check) {
+    existSSID = f_check.readStringUntil('\n'); existSSID.trim();
+    existPASS = f_check.readStringUntil('\n'); existPASS.trim();
+    f_check.close();
+  }
+
+  if (existSSID == ssid && existPASS == pass) return;
+  if (!noteFlashWrite("wifi-credentials")) return;
+
+  File f = LittleFS.open("/cfg.txt", "w");
+  if (f) {
+    f.println(ssid);
+    f.println(pass);
+    f.println(flashWriteCount);
+    f.close();
+  }
+}
+
+bool writeStateFile() {
+  File f = LittleFS.open("/state.txt", "w");
+  if (!f) return false;
+  f.println(deviceMode);
+  f.println(autoTimerDuration);
+  f.println(schedule.year);
+  f.println(schedule.month);
+  f.println(schedule.day);
+  f.println(schedule.startHour);
+  f.println(schedule.startMin);
+  f.println(schedule.endHour);
+  f.println(schedule.endMin);
+  f.println(schedule.active ? 1 : 0);
+  f.println(dailySched.startHour);
+  f.println(dailySched.startMin);
+  f.println(dailySched.endHour);
+  f.println(dailySched.endMin);
+  f.println(dailySched.active     ? 1 : 0);
+  f.println(dailySched.configured ? 1 : 0);
+  f.println(flashWriteCount);
+  f.close();
+  return true;
+}
+
+void saveState(const char* reason = "state") {
+  if (!noteFlashWrite(reason)) return;
+  writeStateFile();
+}
+
+void loadState() {
+  File f = LittleFS.open("/state.txt", "r");
+  if (!f) return;
+
+  deviceMode           = f.readStringUntil('\n').toInt();
+  autoTimerDuration    = (unsigned long)f.readStringUntil('\n').toInt();
+  schedule.year        = f.readStringUntil('\n').toInt();
+  schedule.month       = f.readStringUntil('\n').toInt();
+  schedule.day         = f.readStringUntil('\n').toInt();
+  schedule.startHour   = f.readStringUntil('\n').toInt();
+  schedule.startMin    = f.readStringUntil('\n').toInt();
+  schedule.endHour     = f.readStringUntil('\n').toInt();
+  schedule.endMin      = f.readStringUntil('\n').toInt();
+  schedule.active      = f.readStringUntil('\n').toInt() == 1;
+  dailySched.startHour = f.readStringUntil('\n').toInt();
+  dailySched.startMin  = f.readStringUntil('\n').toInt();
+  dailySched.endHour   = f.readStringUntil('\n').toInt();
+  dailySched.endMin    = f.readStringUntil('\n').toInt();
+  dailySched.active    = f.readStringUntil('\n').toInt() == 1;
+
+  String cfgLine = f.readStringUntil('\n'); cfgLine.trim();
+  if (cfgLine.length() > 0) {
+    dailySched.configured = cfgLine.toInt() == 1;
+  } else {
+    dailySched.configured = dailySched.active
+      || (dailySched.startHour + dailySched.startMin
+          + dailySched.endHour  + dailySched.endMin) > 0;
+  }
+
+  String cStr = f.readStringUntil('\n'); cStr.trim();
+  if (cStr.length() > 0) {
+    unsigned long c = (unsigned long)cStr.toInt();
+    if (c > flashWriteCount) flashWriteCount = c;
+  }
+  f.close();
+
+  if (deviceMode == 1)                  deviceMode = 0;
+  if (deviceMode < 0 || deviceMode > 4) deviceMode = 0;
+
+  schedule.hasTriggeredOn = false;
+  autoTimerRunning        = false;
+  autoInCooldown          = false;
+  dailySched.state        = 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  HTML CAPTIVE PORTAL 
+// ─────────────────────────────────────────────────────────────
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Device Setup</title>
+  <style>
+    body{font-family:Arial,sans-serif;text-align:center;margin-top:40px;background:#f4f4f9}
+    .box{background:#fff;padding:20px;border-radius:8px;box-shadow:0 0 10px rgba(0,0,0,.1);display:inline-block;width:90%;max-width:350px}
+    select,button{margin:8px auto;padding:10px;width:90%;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;display:block;font-size:16px}
+    .ic{width:90%;margin:8px auto;text-align:left}
+    #ms{display:none;width:100%;padding:10px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;margin-bottom:8px;font-size:16px}
+    .ic input[type=password],.ic input[type=text]{width:100%;padding:10px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;font-size:16px}
+    .sp{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:14px;cursor:pointer;color:#444}
+    .sp input{width:auto;margin:0}
+    .pr{background:#0056b3;color:#fff;border:none;cursor:pointer;margin-top:15px}
+    .pr:hover{background:#004494}
+    #sb{background:#6c757d;color:#fff;border:none;cursor:pointer;margin-bottom:15px}
+    #sb:hover{background:#565e64}
+    #st{margin-top:16px;font-weight:700;padding:10px;border-radius:4px;display:none;width:90%;margin-left:auto;margin-right:auto;box-sizing:border-box}
+    .wait{display:block!important;background:#fff3cd;color:#856404}
+    .ok{display:block!important;background:#d4edda;color:#155724}
+    .fail{display:block!important;background:#f8d7da;color:#721c24}
+  </style>
+</head>
+<body>
+<div class="box">
+  <h2>Device Setup</h2>
+  <button id="sb" onclick="doScan()">Scan Networks</button>
+  <select id="sel" onchange="togM()">
+    <option value="">-- select network --</option>
+    <option value="MANUAL">++ Enter SSID Manually ++</option>
+  </select>
+  <div class="ic">
+    <input type="text" id="ms" placeholder="Hidden SSID name">
+    <input type="password" id="pw" placeholder="Password (min 8 chars)">
+    <label class="sp">
+      <input type="checkbox" onchange="document.getElementById('pw').type=this.checked?'text':'password'">
+      Show password
+    </label>
+  </div>
+  <button id="cb" class="pr" onclick="doSave()">Save &amp; Connect</button>
+  <div id="st"></div>
+</div>
+<script>
+let pt;
+window.onload=doScan;
+function togM(){document.getElementById('ms').style.display=document.getElementById('sel').value==='MANUAL'?'block':'none';}
+function ss(c,m){let e=document.getElementById('st');e.className=c;e.innerText=m;}
+function unlock(){document.getElementById('cb').disabled=false;document.getElementById('sb').disabled=false;}
+function doScan(){
+  document.getElementById('sel').innerHTML='<option>Scanning...</option>';
+  document.getElementById('ms').style.display='none';
+  fetch('/scan');
+  let t=setInterval(()=>{
+    fetch('/scan-results').then(r=>r.json()).then(d=>{
+      if(d.status==='done'){
+        clearInterval(t);
+        let s=document.getElementById('sel');
+        s.innerHTML='<option value="">-- select network --</option>';
+        d.networks.forEach(n=>{s.innerHTML+=`<option value="${n.ssid}">${n.ssid} (${n.rssi} dBm)</option>`;});
+        s.innerHTML+='<option value="MANUAL">++ Enter SSID Manually ++</option>';
+      }
+    }).catch(()=>clearInterval(t));
+  },2000);
+}
+function doSave(){
+  let sel=document.getElementById('sel').value;
+  let ssid=sel==='MANUAL'?document.getElementById('ms').value.trim():sel;
+  let pass=document.getElementById('pw').value;
+  if(!sel||sel===''){ss('fail','Select a network first.');return;}
+  if(sel==='MANUAL'&&ssid===''){ss('fail','Type the hidden SSID.');return;}
+  if(pass===''){ss('fail','Password cannot be empty.');return;}
+  if(pass.length<8){ss('fail','Password must be at least 8 characters.');return;}
+  document.getElementById('cb').disabled=true;
+  document.getElementById('sb').disabled=true;
+  clearInterval(pt);
+  ss('wait','Connecting... please wait up to 20s');
+  fetch('/save?ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass))
+    .then(r=>{
+      if(r.ok){pt=setInterval(poll,2000);}
+      else{r.text().then(t=>{ss('fail',t);unlock();});}
+    }).catch(()=>{pt=setInterval(poll,2000);});
+}
+function poll(){
+  fetch('/status').then(r=>r.json()).then(d=>{
+    if(d.s==='ONLINE'){
+      clearInterval(pt);let sec=8;
+      ss('ok','Connected! Portal closes in '+sec+'s...');
+      let ct=setInterval(()=>{sec--;if(sec>0)ss('ok','Connected! Portal closes in '+sec+'s...');else{clearInterval(ct);ss('ok','Portal closed. Device running.');}},1000);
+    }
+    else if(d.s==='FAILED'){
+      clearInterval(pt);
+      ss('fail','Wrong password or out of range.');
+      unlock();
+    }
+    else{ss('wait','Connecting to router...');}
+  }).catch(()=>{});
+}
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ─────────────────────────────────────────────────────────────
+//  START SETUP PORTAL
+// ─────────────────────────────────────────────────────────────
+void startSetupPortal() {
+  inSetupMode        = true;
+  setupStartTime     = millis();
+  portalState        = 0;
+  triggerConnection  = false;
+  tempSSID = "";
+  tempPASS = "";
+
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  snprintf(global_AP_Name, sizeof(global_AP_Name), "Techorc_%s", mac.c_str());
+
+  IPAddress local_IP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(local_IP, gateway, subnet);
+  WiFi.softAP(global_AP_Name, AP_PASS);
+  dnsServer.start(DNS_PORT, "*", local_IP);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
+    r->send_P(200, "text/html", index_html);
+  });
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest* r) {
+    if (WiFi.scanComplete() != WIFI_SCAN_RUNNING) WiFi.scanNetworks(true);
+    r->send(200);
+  });
+  server.on("/scan-results", HTTP_GET, [](AsyncWebServerRequest* r) {
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) {
+      r->send(200, "application/json", F("{\"status\":\"scanning\"}"));
+    } else if (n < 0) {
+      r->send(200, "application/json", F("{\"status\":\"failed\"}"));
+    } else {
+      String json;
+      json.reserve(512);
+      json = F("{\"status\":\"done\",\"networks\":[");
+      for (int i = 0; i < n; ++i) {
+        if (i > 0) json += ',';
+        json += F("{\"ssid\":\"");
+        json += WiFi.SSID(i);
+        json += F("\",\"rssi\":");
+        json += WiFi.RSSI(i);
+        json += '}';
+      }
+      json += F("]}");
+      WiFi.scanDelete();
+      r->send(200, "application/json", json);
+    }
+  });
+  server.on("/save", HTTP_GET, [](AsyncWebServerRequest* r) {
+    if (!r->hasParam("ssid") || !r->hasParam("pass")) {
+      r->send(400, "text/plain", F("Missing parameters")); return;
+    }
+    tempSSID = r->getParam("ssid")->value(); tempSSID.trim();
+    tempPASS = r->getParam("pass")->value();
+    if (tempSSID.length() == 0) { r->send(400, "text/plain", F("SSID is empty")); return; }
+    if (tempPASS.length() == 0) { r->send(400, "text/plain", F("Password is empty")); return; }
+    if (tempPASS.length() < 8)  { r->send(400, "text/plain", F("Password must be 8+ chars")); return; }
+    triggerConnection = true;
+    r->send(200, "text/plain", F("OK"));
+  });
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest* r) {
+    const char* s;
+    switch (portalState) {
+      case 1:  s = "{\"s\":\"PENDING\"}"; break;
+      case 4:  s = "{\"s\":\"ONLINE\"}";  break;
+      case 6:  s = "{\"s\":\"FAILED\"}";  break;
+      default: s = "{\"s\":\"IDLE\"}";    break;
+    }
+    r->send(200, "application/json", s);
+  });
+  server.onNotFound([](AsyncWebServerRequest* r) { r->redirect("/"); });
+  server.begin();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────────────
+void setup() {
+  ESP.wdtEnable(8000);
+
+  pinMode(LED_PIN,   OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);  // relay OFF (active-low)
+  digitalWrite(LED_PIN,   HIGH);  // LED OFF
+  pinMode(PIR_PIN,   INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  Serial.begin(115200, SERIAL_8N1, SERIAL_TX_ONLY);
+  delay(500);
+
+  bool fsMounted = false;
+  for (int i = 0; i < 10; i++) {
+    if (LittleFS.begin()) {
+      fsMounted = true;
+      break; 
+    }
+    delay(1000); 
+    ESP.wdtFeed(); 
+  }
+
+  if (!fsMounted) {
+    delay(1000);
+    ESP.restart(); 
+  }
+
+  loadToken();
+  loadState();
+  unifyFlashCount();
+
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+
+  String savedSSID, savedPASS;
+  bool hasCredentials = loadCredentials(savedSSID, savedPASS);
+
+  if (hasCredentials) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+
+    unsigned long bootStart = millis();
+    while (millis() - bootStart < 15000UL) {
+      ESP.wdtFeed();
+      if (WiFi.status() == WL_CONNECTED) {
+        configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+        lastNtpSync = millis();
+        break;
+      }
+      delay(500);
+    }
+  } else {
+    startSetupPortal();
+  }
+
+  lastLoopExecution = millis();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LOOP
+// ─────────────────────────────────────────────────────────────
+void loop() {
+  ESP.wdtFeed();
+{
+Serial.println("hiii");
+delay(500);}
+
+  // ── 1. OTA HALT ROUTINE ──
+  if (pendingOTA) {
+      pendingOTA = false;
+      
+      // Safety: ensure physical relay is off during check and flash
+      setRelay(false); 
+      
+      // Stop all background logic in RAM temporarily
+      autoTimerRunning = false;
+      schedule.active = false;
+      dailySched.state = 0;
+      
+      // Attempt the update (this blocks until success or failure)
+      checkForUpdate(); 
+      
+      // ── PROPER RECOVERY ──
+      // If code reaches here, it means OTA failed, or there was no new version. 
+      // The ESP did not reboot. We restore the state to resume normal operations!
+      if (isAuthenticated) tcpSend("EVENT: Resuming normal operations. Restoring previous state from Flash memory...");
+      loadState(); 
+      
+      lastLoopExecution = millis(); // Prevent Soft WDT crash after long wait
+      return; 
+  }
+
+  // ── SOFTWARE WATCHDOG ──
+  if (millis() - lastLoopExecution > MAX_LOOP_TIME) {
+    ESP.restart();
+  }
+  lastLoopExecution = millis();
+
+  // ============================================================
+  //  SECTION 1 — SETUP PORTAL STATE MACHINE
+  // ============================================================
+  if (inSetupMode) {
+    dnsServer.processNextRequest();
+
+    if (triggerConnection) {
+      triggerConnection   = false;
+      portalState         = 0;
+      WiFi.disconnect(false);
+      delay(200);
+      WiFi.mode(WIFI_AP_STA);
+      delay(100);
+      WiFi.begin(tempSSID.c_str(), tempPASS.c_str());
+      portalState         = 1;
+      connectionStartTime = millis();
+    }
+
+    if (portalState == 1) {
+      int ws = WiFi.status();
+      if (ws == WL_CONNECTED) {
+        saveCredentials(tempSSID, tempPASS);
+        configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+        lastNtpSync            = millis();
+        portalState           = 4;
+        connectionGraceActive = true;
+        connectionSuccessTime = millis();
+      } else if (
+        ws == WL_CONNECT_FAILED
+        || ws == WL_WRONG_PASSWORD
+        || ws == WL_NO_SSID_AVAIL
+        || millis() - connectionStartTime > 15000UL
+      ) {
+        portalState = 6;
+        WiFi.disconnect(false);
+        tempSSID = "";
+        tempPASS = "";
+      }
+    }
+
+    if (connectionGraceActive
+        && millis() - connectionSuccessTime > GRACE_PERIOD_MS) {
+      server.end();
+      dnsServer.stop();
+      WiFi.mode(WIFI_STA);
+      connectionGraceActive = false;
+      inSetupMode           = false;
+    }
+
+    if (!connectionGraceActive
+        && portalState != 1
+        && millis() - setupStartTime > SETUP_TIMEOUT_MS) {
+      ESP.restart();
+    }
+    return;
+  }
+
+  // ============================================================
+  //  SECTION 1b — WIFI HEALTH
+  // ============================================================
+  if (millis() - lastWifiCheck > WIFI_CHECK_MS) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      wifiDropCount++;
+    } else {
+      if (wifiDropCount > 0) {
+        configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+        lastNtpSync = millis();
+      }
+      wifiDropCount = 0;
+    }
+  }
+
+  // ── PERIODIC NTP RESYNC ──
+  if (WiFi.status() == WL_CONNECTED
+      && millis() - lastNtpSync > NTP_RESYNC_MS) {
+    lastNtpSync = millis();
+    configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) return; 
+
+  // ============================================================
+  //  SECTION 2 — TCP SERVER CONNECTION
+  // ============================================================
+  if (!tcpClient.connected()) {
+    isAuthenticated = false;
+    pendingReset    = false;
+    bufIdx          = 0;
+
+    unsigned long now = millis();
+    if (now - lastReconnectAttempt >= reconnectBackoff) {
+      lastReconnectAttempt = now;
+      tcpClient.stop(); 
+
+      if (tcpClient.connect(serverIP, serverPort)) {
+        tcpClient.setNoDelay(true);
+        reconnectBackoff = RECONNECT_MIN; 
+
+        if (isRegistered) {
+          isAuthenticated = true;
+          tcpClient.println(F("ONLINE: Auto-Authenticated (Verified in Flash)."));
+          sendStatusUpdate();                
+          sendConfigReminderIfNeeded();
+        } else {
+          tcpClient.println(F("ONLINE: Unregistered. Please send your token to verify and unlock."));
+        }
+      } else {
+        reconnectBackoff = min(reconnectBackoff * 2, RECONNECT_MAX);
+      }
+    }
+    goto run_modes;
+  }
+
+  // ============================================================
+  //  SECTION 3 — COMMAND HANDLING
+  // ============================================================
+  while (tcpClient.available() > 0) {
+    char c = tcpClient.read();
+
+    if (c == '\n') {
+      lineBuf[bufIdx] = '\0';
+      int len = bufIdx;
+      bufIdx = 0; 
+
+      while (len > 0 && (lineBuf[len - 1] == '\r' || lineBuf[len - 1] == ' ')) {
+        lineBuf[--len] = '\0';
+      }
+      char* trimmedLine = lineBuf;
+      while (*trimmedLine == ' ') trimmedLine++;
+
+      if (strlen(trimmedLine) == 0) continue; 
+
+      strncpy(upperBuf, trimmedLine, LINE_BUF_SZ - 1);
+      upperBuf[LINE_BUF_SZ - 1] = '\0';
+      for (char* p = upperBuf; *p; ++p) *p = toupper(*p);
+
+      // ────────────────────────────────────────────────────────
+      //  TWO-STEP RESET CONFIRMATION
+      // ────────────────────────────────────────────────────────
+      if (pendingReset) {
+        if (strcmp(trimmedLine, activeToken) == 0) {
+          tcpSend("ACK: Token Verified. FULL RESET in progress. Erasing data and restarting...");
+          delay(100);
+          LittleFS.remove("/cfg.txt");
+          LittleFS.remove("/token.txt");
+          LittleFS.remove("/registered.txt");
+          deviceMode        = 0;
+          autoTimerDuration = 0;
+          dailySched.active = false;
+          dailySched.configured = false;
+          schedule.active   = false;
+          writeStateFile();
+          WiFi.disconnect(true);
+          delay(500);
+          ESP.restart();
+        } else {
+          pendingReset = false;
+          tcpSend("ERR: Invalid Token. Reset aborted.");
+        }
+        continue; 
+      }
+
+      // ────────────────────────────────────────────────────────
+      //  AUTHENTICATION HANDSHAKE
+      // ────────────────────────────────────────────────────────
+      if (!isAuthenticated) {
+        if (strcmp(trimmedLine, activeToken) == 0) {
+          isAuthenticated = true;
+          if (!isRegistered) {
+            isRegistered = true;
+            noteFlashWrite("registration");
+            File f = LittleFS.open("/registered.txt", "w");
+            if (f) { f.println("1"); f.println(flashWriteCount); f.close(); }
+            tcpSend("ACK: Token Verified. Device registered to Flash.");
+          } else {
+            tcpSend("ACK: Authenticated successfully.");
+          }
+          sendStatusUpdate();                
+          sendConfigReminderIfNeeded();
+        } else {
+          tcpSend("ERR: Invalid Token. Send only the token value (no prefix).");
+          tcpClient.stop();
+        }
+        continue; 
+      }
+
+      // ────────────────────────────────────────────────────────
+      //  OTA COMMAND HANDLER (TARGETED BY MAC)
+      // ────────────────────────────────────────────────────────
+      bool isOtaCommand = false;
+      if (strncmp(upperBuf, "MAC=", 4) == 0) {
+        String cmdStr = String(trimmedLine);
+        String myMac = WiFi.macAddress();
+        int macEnd = cmdStr.indexOf(";");
+        if (macEnd != -1) {
+            String receivedMac = cmdStr.substring(4, macEnd);
+            int cmdStart = cmdStr.indexOf("CMD=");
+            if (cmdStart != -1) {
+                String receivedCmd = cmdStr.substring(cmdStart + 4);
+                receivedMac.trim();
+                receivedCmd.trim();
+                if (receivedMac.equalsIgnoreCase(myMac) && receivedCmd.equalsIgnoreCase("UPDATE")) {
+                    isOtaCommand = true;
+                }
+            }
+        }
+      }
+
+      if (isOtaCommand) {
+        tcpSend("ACK: OTA Update requested for this MAC. Halting tasks to check for new firmware...");
+        pendingOTA = true; 
+        continue; // Immediately exit parsing and go to next loop cycle to run OTA
+      }
+
+      // ────────────────────────────────────────────────────────
+      //  FLASH COMMANDS
+      // ────────────────────────────────────────────────────────
+      char ackBuf[128];
+
+      // 1. COMBINED CONFIG  auto:<mins>|daily:HH:MM,HH:MM
+      char* pipe = strchr(upperBuf, '|');
+      if (pipe && strncmp(upperBuf, "AUTO:", 5) == 0) {
+        size_t pipeIdx = (size_t)(pipe - upperBuf);
+        char autoPart[64], dailyPart[64];
+        strncpy(autoPart, trimmedLine, min(pipeIdx, sizeof(autoPart) - 1));
+        autoPart[min(pipeIdx, sizeof(autoPart) - 1)] = '\0';
+        strncpy(dailyPart, trimmedLine + pipeIdx + 1, sizeof(dailyPart) - 1);
+        dailyPart[sizeof(dailyPart) - 1] = '\0';
+
+        int autoMins = parseAutoMinutes(autoPart);
+        DailySchedule ns = {0, 0, 0, 0, false, false, 0};
+
+        char dailyUpper[64];
+        strncpy(dailyUpper, dailyPart, sizeof(dailyUpper) - 1);
+        dailyUpper[sizeof(dailyUpper) - 1] = '\0';
+        for (char* p = dailyUpper; *p; ++p) *p = toupper(*p);
+
+        if (strncmp(dailyUpper, "DAILY:", 6) != 0 || !parseDailyCommand(dailyPart, ns)) {
+          tcpSend("ERR: Bad DAILY format. Use auto:<mins>|daily:HH:MM,HH:MM");
+        } else {
+          bool dailyIsSkip = (ns.startHour == 0 && ns.startMin == 0
+                              && ns.endHour  == 0 && ns.endMin  == 0);
+          if (!dailyIsSkip
+              && (ns.startHour * 60 + ns.startMin) == (ns.endHour * 60 + ns.endMin)) {
+            tcpSend("ERR: DAILY start and end times must differ.");
+          } else {
+            autoTimerDuration = (unsigned long)autoMins * 60000UL;
+            dailySched        = ns;
+
+            if (!dailyIsSkip) {
+              deviceMode          = 4;
+              schedule.active     = false;
+              autoTimerRunning    = false;
+              dailySched.active   = true;
+              dailySched.configured = true;
+              dailySched.state    = 0;
+              setRelay(false);
+            } else if (autoMins > 0) {
+              deviceMode          = 2;
+              schedule.active     = false;
+              dailySched.active   = false;
+              autoTimerRunning    = false;
+              setRelay(false);
+              lastPirState        = digitalRead(PIR_PIN);
+              lastPirChangeTime   = millis();
+            } else {
+              deviceMode          = 0;
+              schedule.active     = false;
+              dailySched.active   = false;
+              autoTimerRunning    = false;
+              setRelay(false);
+            }
+            waitForPirLow = false; 
+            saveState("combined-config");
+
+            char modeBuf[12];
+            modeName(deviceMode, modeBuf, sizeof(modeBuf));
+            snprintf(ackBuf, sizeof(ackBuf),
+                     "ACK: Config Saved. Mode=%s | Auto=%dmin | Daily=%02d:%02d-%02d:%02d",
+                     modeBuf, autoMins,
+                     dailySched.startHour, dailySched.startMin,
+                     dailySched.endHour,   dailySched.endMin);
+            tcpSend(ackBuf);
+            tcpSend("REQUEST:SYNC_STATE");
+            isAuthenticated = false;
+            tcpSend("ACK: Re-authentication required - send the token now.");
+          }
+        }
+        continue;
+      }
+
+      // 2. TOKEN CHANGE:<new_token>
+      if (strncmp(upperBuf, "TOKEN CHANGE:", 13) == 0) {
+        char* newTok = trimmedLine + 13;
+        while (*newTok == ' ') newTok++;
+        if (strlen(newTok) == 0) {
+          tcpSend("ERR: Use format TOKEN CHANGE:<new_token>");
+        } else if (strcmp(newTok, activeToken) == 0) {
+          tcpSend("ERR: New token matches current token.");
+        } else if (strlen(newTok) >= sizeof(activeToken)) {
+          tcpSend("ERR: New token too long.");
+        } else {
+          saveToken(newTok);
+          isAuthenticated = false;
+          tcpSend("ACK: Token updated and saved to Flash. Re-authentication required - send the NEW token now.");
+        }
+        continue;
+      }
+
+      // 3. AUTO CHANGE:<minutes>
+      if (strncmp(upperBuf, "AUTO CHANGE:", 12) == 0) {
+        int mins = atoi(trimmedLine + 12);
+        if (mins <= 0) {
+          tcpSend("ERR: AUTO CHANGE:<minutes> must be > 0");
+        } else {
+          autoTimerDuration = (unsigned long)mins * 60000UL;
+          saveState("auto-duration-change");
+          snprintf(ackBuf, sizeof(ackBuf),
+                   "ACK: AUTO duration updated to %dmin in flash. Mode unchanged.", mins);
+          tcpSend(ackBuf);
+          isAuthenticated = false;
+          tcpSend("ACK: Re-authentication required - send the token now.");
+        }
+        continue;
+      }
+
+      // 4. DAILY CHANGE:HH:MM,HH:MM
+      if (strncmp(upperBuf, "DAILY CHANGE:", 13) == 0) {
+        DailySchedule ns = {0, 0, 0, 0, false, false, 0};
+        if (!parseDailyCommand(trimmedLine, ns)) {
+          tcpSend("ERR: Format: DAILY CHANGE:HH:MM,HH:MM");
+        } else if (ns.startHour * 60 + ns.startMin == ns.endHour * 60 + ns.endMin) {
+          tcpSend("ERR: Start and End times must differ.");
+        } else {
+          dailySched.startHour  = ns.startHour;
+          dailySched.startMin   = ns.startMin;
+          dailySched.endHour    = ns.endHour;
+          dailySched.endMin     = ns.endMin;
+          dailySched.configured = true;
+          saveState("daily-time-change");
+          snprintf(ackBuf, sizeof(ackBuf),
+                   "ACK: DAILY times updated to ON=%02d:%02d OFF=%02d:%02d in flash.",
+                   dailySched.startHour, dailySched.startMin,
+                   dailySched.endHour,   dailySched.endMin);
+          tcpSend(ackBuf);
+          isAuthenticated = false;
+          tcpSend("ACK: Re-authentication required - send the token now.");
+        }
+        continue;
+      }
+
+      // 5. AUTO:ON
+      if (strcmp(upperBuf, "AUTO:ON") == 0) {
+        if (autoTimerDuration == 0) {
+          tcpSend("ERR: No AUTO timer saved. Set one first.");
+        } else {
+          changeMode(2);
+          schedule.active   = false;
+          dailySched.active = false;
+          autoTimerRunning  = false;
+          waitForPirLow     = false; 
+          setRelay(false);
+          lastPirState      = digitalRead(PIR_PIN);
+          lastPirChangeTime = millis();
+          saveState("auto-on");
+          snprintf(ackBuf, sizeof(ackBuf),
+                   "ACK: AUTO_TIMED activated. Duration=%lus. Waiting for motion.",
+                   autoTimerDuration / 1000UL);
+          tcpSend(ackBuf);
+          isAuthenticated = false;
+          tcpSend("ACK: Re-authentication required - send the token now.");
+        }
+        continue;
+      }
+
+      // 6. AUTO:STOP
+      if (strcmp(upperBuf, "AUTO:STOP") == 0) {
+        changeMode(0);
+        autoTimerRunning  = false;
+        setRelay(false);
+        saveState("auto-stop");
+        tcpSend("ACK: AUTO mode stopped. Switched to MANUAL and saved to Flash.");
+        isAuthenticated = false;
+        tcpSend("ACK: Re-authentication required - send the token now.");
+        continue;
+      }
+
+      // 7. DAILY:ON
+      if (strcmp(upperBuf, "DAILY:ON") == 0) {
+        if (!dailySched.configured) {
+          tcpSend("ERR: No DAILY schedule saved. Set one first.");
+        } else {
+          changeMode(4);
+          schedule.active   = false;
+          autoTimerRunning  = false;
+          dailySched.active = true;
+          dailySched.state  = 0;
+          waitForPirLow     = false;
+          setRelay(false);
+          saveState("daily-on");
+          snprintf(ackBuf, sizeof(ackBuf),
+                   "ACK: DAILY activated. ON at %02d:%02d, OFF at %02d:%02d",
+                   dailySched.startHour, dailySched.startMin,
+                   dailySched.endHour,   dailySched.endMin);
+          tcpSend(ackBuf);
+          isAuthenticated = false;
+          tcpSend("ACK: Re-authentication required - send the token now.");
+        }
+        continue;
+      }
+
+      // 8. DAILY:STOP
+      if (strcmp(upperBuf, "DAILY:STOP") == 0) {
+        changeMode(0);
+        dailySched.active = false;
+        setRelay(false);
+        saveState("daily-stop");
+        tcpSend("ACK: DAILY mode stopped. Switched to MANUAL and saved to Flash.");
+        isAuthenticated = false;
+        tcpSend("ACK: Re-authentication required - send the token now.");
+        continue;
+      }
+
+      // ──────────────────────────────────────────────────────
+      //  RAM COMMANDS (VOLATILE — no flash writes)
+      // ──────────────────────────────────────────────────────
+      if (strcmp(upperBuf, "STOP") == 0) {
+        changeMode(0);
+        schedule.active   = false;
+        dailySched.active = false;
+        autoTimerRunning  = false;
+        setRelay(false);
+        tcpSend("ACK: All timers STOPPED. Relay OFF (Manual, Volatile)");
+        continue;
+      }
+
+      if (strcmp(upperBuf, "OFF") == 0) {
+        if (deviceMode == 4) {
+          if (dailySched.state == 1) {
+            dailySched.state = 2;
+            autoTimerRunning = false;
+            setRelay(false);
+            waitForPirLow = true; 
+            tcpSend("ACK: Daily schedule skipped until tomorrow. Relay OFF.");
+          } else if (autoTimerRunning) {
+            autoTimerRunning = false;
+            setRelay(false);
+            waitForPirLow = true; 
+            tcpSend("ACK: Motion timer stopped. PIR waiting for new motion.");
+          } else {
+            setRelay(false);
+            tcpSend("ACK: Relay forced OFF. DAILY mode remains active.");
+          }
+        } else if (deviceMode == 2) {
+          if (autoTimerRunning) {
+            autoTimerRunning = false;
+            setRelay(false);
+            waitForPirLow = true;
+            tcpSend("ACK: Motion timer stopped. AUTO mode remains active. Waiting for new motion.");
+          } else {
+            setRelay(false);
+            tcpSend("ACK: Relay forced OFF. AUTO mode remains active.");
+          }
+        } else {
+          changeMode(0);
+          schedule.active  = false;
+          autoTimerRunning = false;
+          setRelay(false);
+          tcpSend("ACK: Relay OFF (Manual, Volatile)");
+        }
+        continue;
+      }
+
+      if (strcmp(upperBuf, "ON") == 0) {
+        changeMode(0);
+        schedule.active   = false;
+        dailySched.active = false;
+        autoTimerRunning  = false;
+        setRelay(true);
+        tcpSend("ACK: Relay ON (Manual, Volatile)");
+        continue;
+      }
+
+      if (strncmp(upperBuf, "CUSTOM:", 7) == 0) {
+        CustomSchedule ns;
+        if (parseCustomCommand(trimmedLine, ns)) {
+          time_t nowT = time(nullptr);
+          struct tm* t = localtime(&nowT);
+          if (t->tm_year + 1900 < 2024) {
+            tcpSend("ERR: NTP not synced yet. Wait 10s and retry.");
+            continue;
+          }
+          bool pastDate = (ns.year < t->tm_year + 1900)
+            || (ns.year == t->tm_year + 1900 && ns.month < t->tm_mon + 1)
+            || (ns.year == t->tm_year + 1900 && ns.month == t->tm_mon + 1
+                && ns.day < t->tm_mday);
+          if (pastDate) {
+            tcpSend("ERR: Date is in the past.");
+            continue;
+          }
+          bool today = (ns.year  == t->tm_year + 1900
+                        && ns.month == t->tm_mon  + 1
+                        && ns.day   == t->tm_mday);
+          if (today) {
+            int nowM  = t->tm_hour * 60 + t->tm_min;
+            int startM = ns.startHour * 60 + ns.startMin;
+            if (startM <= nowM) {
+              tcpSend("ERR: Start time already passed.");
+              continue;
+            }
+          }
+          if (ns.startHour * 60 + ns.startMin == ns.endHour * 60 + ns.endMin) {
+            tcpSend("ERR: Start and End times must differ.");
+            continue;
+          }
+          changeMode(3);
+          dailySched.active = false;
+          autoTimerRunning  = false;
+          schedule          = ns;
+          setRelay(false);
+          snprintf(ackBuf, sizeof(ackBuf),
+                   "ACK: Volatile Schedule Activated. ON at %02d:%02d, OFF at %02d:%02d",
+                   schedule.startHour, schedule.startMin,
+                   schedule.endHour,   schedule.endMin);
+          tcpSend(ackBuf);
+        } else {
+          tcpSend("ERR: Format: CUSTOM:DD/MM/YYYY;HH:MM;HH:MM");
+        }
+        continue;
+      }
+
+      // ──────────────────────────────────────────────────────
+      //  SYSTEM & DIAGNOSTIC COMMANDS
+      // ──────────────────────────────────────────────────────
+      if (strcmp(upperBuf, "RESET") == 0) {
+        pendingReset = true;
+        tcpSend("REQUEST: Warning! This will erase all Wi-Fi and Security data. Send your token now to confirm.");
+        continue;
+      }
+
+      if (strcmp(upperBuf, "FLASH STATUS") == 0) {
+        uint32_t percent = (uint32_t)((flashWriteCount * 100UL) / 90000UL);
+        snprintf(ackBuf, sizeof(ackBuf),
+                 "STATUS: Flash Memory=(%lu/90k) | Wear=%lu%% | Health=%s",
+                 flashWriteCount, (unsigned long)percent,
+                 (percent < 50 ? "GOOD" : (percent < 90 ? "WARNING" : "CRITICAL")));
+        tcpSend(ackBuf);
+        continue;
+      }
+
+      if (strcmp(upperBuf, "FLASH LIST") == 0) {
+        tcpSend("FLASH COMMANDS (writes to flash / persist across reboot):");
+        tcpSend("  RESET                           -> 2-Step FULL WIPE of WiFi and Registration");
+        tcpSend("  <token>                         -> first-time correct token = auto REGISTER + SAVE");
+        tcpSend("  AUTO:<mins>|DAILY:HH:MM,HH:MM   -> combined config save (sets mode)");
+        tcpSend("  AUTO CHANGE:<mins>              -> update AUTO duration only");
+        tcpSend("  AUTO:ON                         -> activate AUTO_TIMED mode (saved)");
+        tcpSend("  AUTO:STOP                       -> stop AUTO, back to MANUAL (saved)");
+        tcpSend("  DAILY CHANGE:HH:MM,HH:MM        -> update DAILY times only");
+        tcpSend("  DAILY:ON                        -> activate DAILY mode (saved)");
+        tcpSend("  DAILY:STOP                      -> stop DAILY, back to MANUAL (saved)");
+        tcpSend("  TOKEN CHANGE:<new_token>        -> replace token (forces re-auth)");
+        tcpSend("NON-FLASH (RAM only, volatile): ON, OFF, STOP, CUSTOM:DD/MM/YYYY;HH:MM;HH:MM");
+        tcpSend("DIAGNOSTIC (no write):          STATUS, FLASH STATUS, FLASH LIST");
+        continue;
+      }
+
+      if (strcmp(upperBuf, "STATUS") == 0) {
+        sendStatusUpdate();
+        continue;
+      }
+
+      tcpSend("ERR: Unknown command");
+      if (!isDeviceConfigured()) {
+        tcpSend("REMINDER: Device not yet configured. Send -> auto:<mins>|daily:HH:MM,HH:MM");
+      }
+    }
+    else if (c != '\r') {
+      if (bufIdx < LINE_BUF_SZ - 1) {
+        lineBuf[bufIdx++] = c;
+      }
+    }
+  }
+
+  // ── SILENT HEARTBEAT ──
+  run_modes:
+
+  if (isAuthenticated && millis() - lastHeartbeatTime > HEARTBEAT_MS) {
+    lastHeartbeatTime = millis();
+    if (!tcpSend(" ")) {
+      Serial.println(F("Heartbeat: dead connection — reconnecting."));
+    }
+  }
+
+  // ============================================================
+  //  SECTION 4 — MODE EXECUTION
+  // ============================================================
+
+  // ── MODE 2 & 4: AUTO_TIMED & DAILY HYBRID ──
+  if (deviceMode == 2 || (deviceMode == 4 && dailySched.active)) {
+
+    bool inDailyWindow = false;
+
+    if (deviceMode == 4) {
+      time_t nowT = time(nullptr);
+      struct tm* t = localtime(&nowT);
+      if (t->tm_year + 1900 >= 2024) {
+        int nowMins   = t->tm_hour * 60 + t->tm_min;
+        int startMins = dailySched.startHour * 60 + dailySched.startMin;
+        int endMins   = dailySched.endHour   * 60 + dailySched.endMin;
+
+        if (startMins < endMins) {
+          inDailyWindow = (nowMins >= startMins && nowMins < endMins);
+        } else {
+          inDailyWindow = (nowMins >= startMins || nowMins < endMins);
+        }
+      }
+    }
+
+    if (deviceMode == 4) {
+      if (inDailyWindow) {
+        if (dailySched.state == 0) {
+          dailySched.state = 1;
+          autoTimerRunning = false;
+          setRelay(true);
+          if (isAuthenticated) tcpSend("EVENT: Daily schedule active - Relay ON (PIR suspended)");
+        }
+      } else {
+        if (dailySched.state == 1) {
+          dailySched.state = 0;
+          if (!autoTimerRunning) setRelay(false);
+          if (isAuthenticated) tcpSend("EVENT: Daily schedule finished - Relay OFF (PIR resumed)");
+        } else if (dailySched.state == 2) {
+          dailySched.state = 0;
+          if (!autoTimerRunning) setRelay(false);
+          if (isAuthenticated) tcpSend("EVENT: Skip-today period ended - DAILY resumed for next window.");
+        }
+      }
+    }
+
+    bool runPirLogic = false;
+    if (deviceMode == 2) {
+      runPirLogic = true;
+    } else if (deviceMode == 4 && autoTimerDuration > 0) {
+      runPirLogic = (dailySched.state != 1);
+    }
+
+    if (runPirLogic) {
+      bool pir = digitalRead(PIR_PIN);
+
+      if (pir != lastPirState) {
+        if (millis() - lastPirChangeTime > DEBOUNCE_MS) {
+          lastPirChangeTime = millis();
+          lastPirState      = pir;
+        }
+      }
+      
+      if (pir == LOW) {
+        waitForPirLow = false; 
+      }
+
+      if (autoInCooldown) {
+        if (millis() - autoCooldownStart >= AUTO_COOLDOWN_MS) {
+          autoInCooldown = false;
+        }
+      }
+
+      if (!autoTimerRunning && !autoInCooldown && pir == HIGH && !waitForPirLow
+          && millis() - lastPirChangeTime >= DEBOUNCE_MS) {
+        setRelay(true);
+        autoTimerRunning   = true;
+        autoTimerStartTime = millis();
+
+        if (isAuthenticated) {
+          char buf[64];
+          snprintf(buf, sizeof(buf),
+                   "EVENT: Motion Detected - Relay ON for %lus",
+                   autoTimerDuration / 1000UL);
+          tcpSend(buf);
+        }
+      }
+
+      if (autoTimerRunning && millis() - autoTimerStartTime >= autoTimerDuration) {
+        autoTimerRunning = false;
+        setRelay(false);
+        autoInCooldown    = true;
+        autoCooldownStart = millis();
+        if (isAuthenticated) tcpSend("EVENT: Timer expired - Relay OFF");
+      }
+    }
+  }
+
+  // ── MODE 3: CUSTOM ──
+  else if (deviceMode == 3 && schedule.active) {
+    time_t nowT = time(nullptr);
+    struct tm* t = localtime(&nowT);
+    if (t->tm_year + 1900 < 2024) return;
+
+    bool isToday = (schedule.year  == t->tm_year + 1900
+                    && schedule.month == t->tm_mon  + 1
+                    && schedule.day   == t->tm_mday);
+    if (!isToday) return;
+
+    int nowMins   = t->tm_hour * 60 + t->tm_min;
+    int startMins = schedule.startHour * 60 + schedule.startMin;
+    int endMins   = schedule.endHour   * 60 + schedule.endMin;
+    bool inWindow = (nowMins >= startMins && nowMins < endMins);
+
+    if (inWindow) {
+      if (!schedule.hasTriggeredOn) {
+        schedule.hasTriggeredOn = true;
+        setRelay(true);
+        if (isAuthenticated) tcpSend("EVENT: Schedule started - Relay ON");
+      }
+    } else if (schedule.hasTriggeredOn) {
+      setRelay(false);
+      schedule.active = false;
+      if (isAuthenticated) tcpSend("EVENT: Schedule finished - Relay OFF");
+      changeMode(0);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  NEW OTA FUNCTIONS WITH RAM PROTECTION FOR ESP-01S
+// ─────────────────────────────────────────────────────────────
+void checkForUpdate()
+{
+    if (isAuthenticated) tcpSend("EVENT: Freeing RAM and connecting to GitHub Version Control...");
+    Serial.println("Checking GitHub Version...");
+
+    // 1. FREE UP RAM: Stop heavy background tasks completely
+    server.end();      // Kill the AsyncWebServer
+    dnsServer.stop();  // Kill the DNS server
+
+    WiFiClientSecure client;
+    client.setInsecure(); // Required for downloading from HTTPS Github
+    
+    // 2. SHRINK SSL BUFFERS: Tell the ESP to use minimal RAM for HTTPS to prevent crash
+    client.setBufferSizes(1024, 512);
+
+    HTTPClient http;
+    
+    // Feed the watchdog to prevent hardware crash during internet request
+    ESP.wdtFeed(); 
+
+    if (!http.begin(client, versionURL)) {
+        Serial.println("HTTP Begin Failed");
+        if (isAuthenticated) tcpSend("ERR: Failed to connect to GitHub. Aborting OTA.");
+        return; 
+    }
+
+    int httpCode = http.GET();
+    ESP.wdtFeed(); // Feed it again after HTTP response
+
+    if (httpCode == HTTP_CODE_OK) {
+        String latestVersion = http.getString();
+        latestVersion.trim();
+
+        char buf[128];
+        snprintf(buf, sizeof(buf), "EVENT: Current Version: %s | Latest Version: %s", CURRENT_VERSION, latestVersion.c_str());
+        if (isAuthenticated) tcpSend(buf);
+
+        if (latestVersion != CURRENT_VERSION) {
+            if (isAuthenticated) tcpSend("EVENT: New firmware found. Downloading now. Do NOT power off...");
+            performOTA();
+        } else {
+            if (isAuthenticated) tcpSend("EVENT: System is already running the latest version. Aborting OTA.");
+        }
+    } else {
+        if (isAuthenticated) tcpSend("ERR: Version Check Failed (HTTP Error). Aborting OTA.");
+    }
+    http.end();
+}
+
+void performOTA()
+{
+    Serial.println("Starting OTA...");
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    
+    // Apply the same RAM-saving buffers to the actual file download client
+    client.setBufferSizes(1024, 512);
+
+    t_httpUpdate_return ret;
+    
+    // This function will block entirely until download succeeds or fails.
+    // It feeds the hardware WDT automatically while downloading.
+    ret = ESPhttpUpdate.update(client, firmwareURL);
+
+    // If we reach the switch statement, the device DID NOT reboot.
+    // This means the download either failed or was corrupted.
+    switch (ret) {
+        case HTTP_UPDATE_FAILED:
+            char errBuf[128];
+            snprintf(errBuf, sizeof(errBuf), "ERR: Download Corrupted or Failed Error(%d): %s", 
+                     ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+            Serial.println(errBuf);
+            if (isAuthenticated) tcpSend(errBuf);
+            break; 
+
+        case HTTP_UPDATE_NO_UPDATES:
+            if (isAuthenticated) tcpSend("EVENT: Server reported no valid .bin file.");
+            break;
+
+        case HTTP_UPDATE_OK:
+            if (isAuthenticated) tcpSend("SUCCESS: Update flashed. Rebooting device now...");
+            delay(500); 
+            break;
+    }
+}
