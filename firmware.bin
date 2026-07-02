@@ -1038,49 +1038,51 @@ delay(500);}
 
 
 
-// Ensure trimmedLine is a valid C-string before this
+/// 1. Prepare and Clean the Incoming String
 String cmdStr = String(trimmedLine);
-cmdStr.trim(); // Remove all whitespace and newline characters
-cmdStr.toUpperCase(); // Standardize everything to uppercase
+cmdStr.trim();            // Remove leading/trailing \r, \n, spaces
+cmdStr.toUpperCase();     // Force consistency (e.g., "mac=" becomes "MAC=")
 
+// 2. Get and Clean the Local MAC
 String myMac = WiFi.macAddress();
-myMac.toUpperCase(); // Standardize your MAC to uppercase
+myMac.trim();
+myMac.toUpperCase();
 
 bool isOtaCommand = false;
 
-if (cmdStr.startsWith("MAC=")) {
-    int macEnd = cmdStr.indexOf(";");
-    int cmdStart = cmdStr.indexOf("CMD=");
+// 3. Find Positions
+int macStart = cmdStr.indexOf("MAC=");
+int cmdStart = cmdStr.indexOf("CMD=");
+int macEnd   = cmdStr.indexOf(";", macStart); // Look for ; after MAC=
+
+// 4. Validate and Parse
+if (macStart != -1 && cmdStart != -1 && macEnd != -1) {
+    // Extract strings based on known positions
+    String receivedMac = cmdStr.substring(macStart + 4, macEnd);
+    String receivedCmd = cmdStr.substring(cmdStart + 4);
     
-    if (macEnd != -1 && cmdStart != -1) {
-        String receivedMac = cmdStr.substring(4, macEnd);
-        String receivedCmd = cmdStr.substring(cmdStart + 4);
-        
-        // Debug
-        Serial.println("Parsed MAC: " + receivedMac);
-        Serial.println("Parsed CMD: " + receivedCmd);
+    // Clean extracted parts just in case
+    receivedMac.trim();
+    receivedCmd.trim();
 
-        if (receivedMac.equals(myMac) && receivedCmd.equals("UPDATE")) {
-            isOtaCommand = true;
-        }
+    // 5. Final Comparison
+    if (receivedMac.equals(myMac) && receivedCmd.equals("UPDATE")) {
+        isOtaCommand = true;
+    } else {
+        // Log this specifically to see where it mismatches
+        Serial.println("DEBUG: MAC Match: " + String(receivedMac.equals(myMac)));
+        Serial.println("DEBUG: CMD Match: " + String(receivedCmd.equals("UPDATE")));
     }
 }
 
+// 6. Execution
 if (isOtaCommand) {
-    tcpSend("ACK: OTA Update requested for this MAC.");
+    tcpSend("ACK: OTA Update requested for this MAC. Halting tasks...");
     pendingOTA = true; 
-} else {
-    // If it was meant to be a command but failed
-    if (cmdStr.startsWith("MAC=")) {
-        tcpSend("ERR: Command parsing failed (Check MAC or CMD)");
-    }
+} else if (cmdStr.startsWith("MAC=")) {
+    // This only triggers if it started with MAC= but failed validation
+    tcpSend("ERR: Command parsing failed (MAC mismatch or bad format)");
 }
-
-      if (isOtaCommand) {
-        tcpSend("ACK: OTA Update requested for this MAC. Halting tasks to check for new firmware...");
-        pendingOTA = true; 
-        continue; // Immediately exit parsing and go to next loop cycle to run OTA
-      }
 
       // ────────────────────────────────────────────────────────
       //  FLASH COMMANDS
