@@ -1016,9 +1016,12 @@ void loop() {
     // ────────────────────────────────────────────────────────
       //  SMART OTA UPDATE LOGIC (Fixed for GitHub TLS)
       // ────────────────────────────────────────────────────────
+      // ────────────────────────────────────────────────────────
+      //  1. CHECK FOR UPDATE (The Version Check)
+      // ────────────────────────────────────────────────────────
       if (strcmp(upperBuf, targetUpdateCmdStr) == 0) {
         
-        // 1. EXECUTE YOUR IDEA: Pause background timers/relays BEFORE the heavy version check
+        // Pause background tasks BEFORE checking to free RAM
         changeMode(0);
         autoTimerRunning = false;
         dailySched.active = false;
@@ -1029,8 +1032,7 @@ void loop() {
 
         WiFiClientSecure secureClient;
         secureClient.setInsecure();            
-        // CRITICAL FIX: DO NOT use setBufferSizes() here. 
-        // GitHub does not support small fragments. We must let it use the default 16KB buffer.
+        // NO setBufferSizes() here. GitHub requires the full 16KB buffer for the handshake.
 
         HTTPClient http;
         http.begin(secureClient, "https://raw.githubusercontent.com/karthii12345/tech_ota/refs/heads/main/version.txt");
@@ -1048,7 +1050,7 @@ void loop() {
           } else {
             snprintf(buf, sizeof(buf), "UPDATE_READY: Current v%s -> New v%s. Send YES to install.", CURRENT_VERSION, latestVersion.c_str());
             tcpSend(buf);
-            pendingOtaUpdate = true; // Wait for "YES" command
+            pendingOtaUpdate = true; // Unlock the "YES" command
           }
         } else {
           char ebuf[96];
@@ -1061,7 +1063,7 @@ void loop() {
       }
 
       // ────────────────────────────────────────────────────────
-      //  EXECUTE OTA UPDATE ON "YES"
+      //  2. EXECUTE OTA UPDATE ON "YES" (With Redirect Fix)
       // ────────────────────────────────────────────────────────
       if (pendingOtaUpdate && strcmp(upperBuf, "YES") == 0) {
         pendingOtaUpdate = false;
@@ -1069,7 +1071,7 @@ void loop() {
         tcpSend("ACK: Starting firmware download... Device will reboot on success.");
         delay(500);
 
-        // 2. Free maximum RAM for the actual binary download
+        // Kill the TCP connection to free up maximum RAM for the download
         tcpClient.stop(); 
         isAuthenticated = false;
 
@@ -1077,25 +1079,29 @@ void loop() {
 
         WiFiClientSecure otaClient;
         otaClient.setInsecure();
-        // CRITICAL FIX: Again, NO setBufferSizes() here. GitHub requires the full 16KB buffer.
-
+        
+        // THE CRITICAL FIX: Tell the ESP to follow GitHub's CDN redirects!
+        ESPhttpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
         ESPhttpUpdate.rebootOnUpdate(true);
+
         t_httpUpdate_return ret = ESPhttpUpdate.update(otaClient, "https://raw.githubusercontent.com/karthii12345/tech_ota/refs/heads/main/firmware.bin");
 
-        // Fallback recovery
+        // Fallback recovery if the download drops
         if (ret != HTTP_UPDATE_OK) {
           Serial.printf("ERR: OTA Failed (code %d): %s.\n", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
           delay(1000);
-          ESP.restart(); // Clear fragmented memory and restart clean
+          ESP.restart(); // Clear fragmented memory and restart safely
         }
         continue;
       }
 
+      // ────────────────────────────────────────────────────────
+      //  3. CANCEL UPDATE ON ANY OTHER COMMAND
+      // ────────────────────────────────────────────────────────
       if (pendingOtaUpdate) {
         pendingOtaUpdate = false;
         tcpSend("ACK: Update cancelled. Normal command processing resumed.");
       }
-
       // ────────────────────────────────────────────────────────
       //  TWO-STEP RESET CONFIRMATION
       // ────────────────────────────────────────────────────────
